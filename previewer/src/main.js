@@ -74,8 +74,10 @@ function init() {
   canvas.addEventListener('touchmove', onTouchMove, { passive: false });
   canvas.addEventListener('touchend', onTouchEnd);
 
-  // File input
-  document.getElementById('file-input').addEventListener('change', onFileSelect);
+  // Manifest dropdown
+  const select = document.getElementById('manifest-select');
+  select.addEventListener('change', onManifestSelect);
+  loadManifestList();
 
   // Drag and drop
   const dropTarget = container;
@@ -212,11 +214,52 @@ function onResize() {
   renderer.setSize(w, h);
 }
 
-// --- File Loading ---
-function onFileSelect(e) {
-  const file = e.target.files[0];
+// --- Manifest List Loading ---
+function loadManifestList() {
+  fetch('/api/manifests')
+    .then(r => r.json())
+    .then(files => {
+      const select = document.getElementById('manifest-select');
+      files.forEach(f => {
+        const opt = document.createElement('option');
+        opt.value = f;
+        opt.textContent = f.replace('_manifest.json', '').replace(/_/g, ' ');
+        select.appendChild(opt);
+      });
+      // Auto-select if URL param matches or only one manifest
+      const params = new URLSearchParams(window.location.search);
+      const manifestParam = params.get('manifest');
+      if (manifestParam) {
+        const match = files.find(f => manifestParam.includes(f));
+        if (match) {
+          select.value = match;
+          fetchAndLoadManifest(match);
+        }
+      } else if (files.length === 1) {
+        select.value = files[0];
+        fetchAndLoadManifest(files[0]);
+      }
+    })
+    .catch(() => {});
+}
+
+function onManifestSelect(e) {
+  const file = e.target.value;
   if (!file) return;
-  readManifestFile(file);
+  fetchAndLoadManifest(file);
+}
+
+function fetchAndLoadManifest(filename) {
+  fetch(`/output/${filename}`)
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .then(data => loadManifest(data))
+    .catch(err => {
+      console.error('Failed to load manifest:', err);
+      showError(`Failed to load ${filename}`);
+    });
 }
 
 function onDrop(e) {
@@ -224,22 +267,18 @@ function onDrop(e) {
   document.getElementById('drop-overlay').classList.remove('active');
   const file = e.dataTransfer.files[0];
   if (file && file.name.endsWith('.json')) {
-    readManifestFile(file);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        loadManifest(data);
+      } catch (err) {
+        console.error('Failed to parse manifest:', err);
+        showError('Failed to parse manifest file. Check that it is valid JSON.');
+      }
+    };
+    reader.readAsText(file);
   }
-}
-
-function readManifestFile(file) {
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    try {
-      const data = JSON.parse(e.target.result);
-      loadManifest(data);
-    } catch (err) {
-      console.error('Failed to parse manifest:', err);
-      showError('Failed to parse manifest file. Check that it is valid JSON.');
-    }
-  };
-  reader.readAsText(file);
 }
 
 // --- Manifest → Scene ---
@@ -428,29 +467,5 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-// --- Check URL params for auto-load ---
-function checkUrlParams() {
-  const params = new URLSearchParams(window.location.search);
-  const manifestUrl = params.get('manifest');
-  if (manifestUrl) {
-    let url;
-    try { url = new URL(manifestUrl, window.location.origin); } catch {
-      showError('Invalid manifest URL parameter.');
-      return;
-    }
-    fetch(url)
-      .then(r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then(data => loadManifest(data))
-      .catch(err => {
-        console.error('Failed to load manifest from URL:', err);
-        showError('Failed to load manifest from URL.');
-      });
-  }
-}
-
 // --- Start ---
 init();
-checkUrlParams();

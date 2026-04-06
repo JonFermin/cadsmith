@@ -5,7 +5,7 @@ A Claude Code skill that generates parametric OpenSCAD (.scad) files and interac
 ## Install
 
 ```bash
-git clone <this-repo> scad-forge
+git clone git@github.com:JonFermin/scad-forge.git
 cd scad-forge
 ```
 
