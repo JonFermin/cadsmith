@@ -1,6 +1,10 @@
 .DS_Store
 output/*.scad
 output/*.stl
+output/*.obj
+output/*.glb
+output/*.gltf
+output/*.bin
 output/*.json
 output/*.png
 !output/.gitkeep
