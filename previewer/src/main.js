@@ -1,5 +1,14 @@
 import * as THREE from 'three';
 
+// --- Error Display ---
+function showError(message) {
+  const toast = document.getElementById('error-toast');
+  toast.textContent = message;
+  toast.style.display = 'block';
+  clearTimeout(showError._timer);
+  showError._timer = setTimeout(() => { toast.style.display = 'none'; }, 5000);
+}
+
 // --- State ---
 let scene, camera, renderer, modelGroup;
 let manifest = null;
@@ -227,6 +236,7 @@ function readManifestFile(file) {
       loadManifest(data);
     } catch (err) {
       console.error('Failed to parse manifest:', err);
+      showError('Failed to parse manifest file. Check that it is valid JSON.');
     }
   };
   reader.readAsText(file);
@@ -423,10 +433,21 @@ function checkUrlParams() {
   const params = new URLSearchParams(window.location.search);
   const manifestUrl = params.get('manifest');
   if (manifestUrl) {
-    fetch(manifestUrl)
-      .then(r => r.json())
+    let url;
+    try { url = new URL(manifestUrl, window.location.origin); } catch {
+      showError('Invalid manifest URL parameter.');
+      return;
+    }
+    fetch(url)
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then(data => loadManifest(data))
-      .catch(err => console.error('Failed to load manifest from URL:', err));
+      .catch(err => {
+        console.error('Failed to load manifest from URL:', err);
+        showError('Failed to load manifest from URL.');
+      });
   }
 }
 
