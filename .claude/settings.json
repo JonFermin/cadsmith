@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'cd /c/Users/honsf/DEVELOP/scad-forge/previewer && set -a && source .env 2>/dev/null; set +a && if netstat.exe -ano 2>/dev/null | grep -q \"LISTENING.*:3000 \"; then echo \"Previewer already running on port 3000\"; else node_modules/.bin/vite --host --port 3000 > /tmp/scad-forge-previewer.log 2>&1 & sleep 2 && echo \"Previewer started on port 3000\"; fi && if tailscale.exe serve status 2>&1 | grep -q 3000; then echo \"Tailscale serve already active\"; else tailscale.exe serve --bg 3000 2>&1 && echo \"Tailscale serve started\"; fi'"
+            "command": "bash -c 'cd /c/Users/honsf/DEVELOP/cadsmith/previewer && if powershell.exe -NoProfile -Command \"Get-NetTCPConnection -State Listen -LocalPort 3000\" >/dev/null 2>&1; then echo \"Previewer already running on port 3000\"; else npm run dev > /tmp/cadsmith-previewer.log 2>&1 & sleep 3 && echo \"Previewer started on port 3000\"; fi && if tailscale.exe serve status 2>&1 | grep -q 3000; then echo \"Tailscale serve already active\"; else tailscale.exe serve --bg 3000 2>&1 && echo \"Tailscale serve started\"; fi'"
           }
         ]
       }
