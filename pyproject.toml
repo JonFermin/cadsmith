@@ -18,7 +18,10 @@ parts = [
 mech = "mech.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "playwright>=1.63.0",
+    "pytest>=8",
+]
 
 [build-system]
 requires = ["hatchling"]
