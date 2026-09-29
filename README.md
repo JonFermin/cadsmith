@@ -21,6 +21,7 @@ From Claude Code:
 /make-model create a cable organizer with 6 slots
 /edit-model street_intersection
 /export-model bracket -f glb
+/make-mechanism a servo arm that lifts 100 g through 180°
 ```
 
 Or just describe what you want in natural language — the CLAUDE.md hints Claude to use the skill when you mention modeling or designing physical objects.
@@ -32,6 +33,7 @@ Or just describe what you want in natural language — the CLAUDE.md hints Claud
 | `/make-model` | Generate parametric build123d Python models + Three.js preview manifests |
 | `/edit-model` | Review and fix existing models via reviewer/fixer agent team |
 | `/export-model` | Export models to STL, OBJ, glTF, or GLB via Blender pipeline |
+| `/make-mechanism` | Design and verify moving assemblies with the `mech` framework (see below) |
 
 ## Previewer
 
@@ -44,6 +46,51 @@ npm run dev
 ```
 
 This opens a browser at http://localhost:3000. Load a `_manifest.json` file via the file picker, drag & drop, or URL parameter.
+
+## Mechanisms (`mech`)
+
+`mech` analyzes moving assemblies — linkages, hinges, gear trains, lead-screw stages, servo
+arms — from a short build123d **model script**: parts modeled in place, joints, and intent
+(actuators, motion studies, design targets). Everything else is deterministic: kinematics with
+loop closure, clearance/interference sweeps over the motion, mass properties, quasi-static gravity
+holding loads, target checks, viewer export and screenshots. A design iteration is one command
+and a ~10-line summary. Out of scope: dynamics, friction, FEA.
+
+```bash
+uv sync                                          # Python 3.12 env (build123d, numpy, scipy)
+uv run mech run examples/four_bar.py             # analyze + export output/four_bar.mech/
+uv run mech run examples/hinged_box.py -p gap=-1 # override build() params
+uv run mech check examples/gear_train.py         # validate + home-pose clearance, no studies
+uv run mech sweep examples/four_bar.py crank=30:45:5   # parameter grid, one row per variant
+uv run mech shot four_bar --ghost 6 --layout quad      # headless PNG (needs playwright)
+uv run mech list                                 # exported mechanisms and their status
+uv run pytest                                    # test suite (analytic checks)
+```
+
+```
+mech four_bar — PASS   4 parts · 3 joints (1 driver, 2 passive) · 1 loop · 42.4 g · CoG (60.8, 22.5, 3.6)
+OK   loop p_B closed (max 6.96e-14 mm) · no branch jumps · mobility 0
+load j_crank max 0 N·m @f0 · capacity 0.5 → SF ∞
+targets 1/1 · rocker swing span:j_rocker 62.1 ≥ 40
+ranges j_crank 0…360° · j_coupler −360…0° · j_rocker −13.2…48.9° · probe mid Δ(71.1, 58.0, 0) path 197 mm
+Δprev: first run
+view http://localhost:3000/mech.html?m=four_bar&ghost=6&layout=quad&ui=0 · shot: uv run mech shot four_bar
+```
+
+Exit codes: PASS 0, WARN 1, FAIL 2, INVALID/error 3. Units: mm, degrees, g, N·m / N; Z up.
+
+- **Examples** (`examples/`): `four_bar`, `slider_crank`, `gear_train` (NEMA 17 + 15:30 gears +
+  625 bearing), `leadscrew_stage` (T8 screw, LM8UU carriage), `pendulum_arm` (MG996R servo,
+  payload, safety-factor target), `hinged_box` (two lids; `gap` drives tight vs interference).
+  Each is checked against closed-form truth in `tests/test_examples.py`.
+- **Standard parts** (`mech.parts`): NEMA 17/23, SG90/MG996R/N20 motors, ball and linear
+  bearings, involute spur gears/gear pairs/racks, GT2 pulleys, rods, T8 screw and nut, 2020/2040
+  extrusions, ISO fasteners, ISO 286 fits — real dimensions, simplified geometry, attachment frames.
+- **Viewer**: `cd previewer && npm run dev`, then open the `view` URL from the summary
+  (`/mech.html?m=<name>`): timeline, ghosts, section plane, explode, issue list that jumps to the
+  offending frame. `npm run build` produces the static bundle `mech shot` uses.
+- **Docs**: the contract is `docs/MECH_SPEC.md`; the Claude-facing workflow and API cheat-sheet
+  are `.claude/skills/make-mechanism/SKILL.md` and `references/mech-api.md`.
 
 ## How it works
 
@@ -64,11 +111,16 @@ cadsmith/
 │   ├── skills/
 │   │   ├── make-model/           # Model generation skill
 │   │   ├── edit-model/           # Review & fix skill
-│   │   └── export-model/         # Export pipeline skill
+│   │   ├── export-model/         # Export pipeline skill
+│   │   └── make-mechanism/       # Mechanism design + mech analysis skill
 │   └── agents/
 │       ├── review-model.md       # Visual review agent
 │       └── fix-model.md          # Targeted fix agent
-├── previewer/                    # Three.js preview app (Vite)
+├── mech/                         # Mechanism analysis framework (Python package, `mech` CLI)
+├── examples/                     # Reference mechanism scripts
+├── tests/                        # pytest suite for mech
+├── docs/MECH_SPEC.md             # mech contract
+├── previewer/                    # Three.js preview app (Vite): index.html + mech.html
 ├── pipeline/                     # Export pipeline (Blender)
 ├── output/                       # Generated models and manifests (gitignored)
 ├── CLAUDE.md                     # Project-level Claude instructions
