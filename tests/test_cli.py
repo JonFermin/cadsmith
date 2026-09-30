@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -17,6 +18,7 @@ from mech.sweep import grid, parse_axis
 
 FIXTURES = Path(__file__).parent / "fixtures"
 ARM = str(FIXTURES / "arm.py")
+TWO = str(FIXTURES / "two_studies.py")
 RAISES = str(FIXTURES / "raises.py")
 REPO = Path(__file__).resolve().parents[1]
 
@@ -93,9 +95,13 @@ def test_missing_script_and_bad_arguments(capsys, tmp_path):
 
 
 def test_no_export_and_study_filter(capsys, tmp_path):
-    code, out, _ = _run(capsys, "run", ARM, "--no-export", "--frames", "4", "--output-dir", tmp_path)
+    code, out, _ = _run(capsys, "run", ARM, "--no-export", "--output-dir", tmp_path)
     assert code == 0 and not (tmp_path / "arm.mech").exists()
     assert out.splitlines()[-1] == "view: not exported (drop --no-export to write output/arm.mech)"
+    code, out, _ = _run(capsys, "run", ARM, "--no-export", "--frames", "4", "--output-dir", tmp_path)
+    assert code == 0 and not (tmp_path / "arm.mech").exists()
+    assert out.splitlines()[0].startswith("mech arm — PASS (partial run: --frames 4)   ")
+    assert out.splitlines()[-1].startswith("view: not exported — partial run; arm.mech keeps the last full run")
     code, out, _ = _run(capsys, "run", ARM, "--study", "swnig", "--output-dir", tmp_path)
     assert code == 3 and "study 'swnig' (requested): no such study (did you mean 'swing'?)" in out
 
@@ -105,9 +111,93 @@ def test_delta_prev_across_runs(capsys, tmp_path):
     code, out, _ = _run(capsys, "run", ARM, "-p", "bump=True", "--output-dir", tmp_path)
     assert code == 2
     dprev = next(line for line in out.splitlines() if line.startswith("Δprev"))
-    assert dprev.startswith("Δprev: status PASS→FAIL · new interference arm/block")
+    assert dprev.startswith("Δprev: status PASS→FAIL · params bump False→True · new interference arm/block")
     _, out, _ = _run(capsys, "run", ARM, "--output-dir", tmp_path)
-    assert "Δprev: status FAIL→PASS · fixed interference arm/block" in out
+    assert "Δprev: status FAIL→PASS · params bump True→False · fixed interference arm/block" in out
+
+
+def test_partial_runs_never_replace_the_last_full_run(capsys, tmp_path):
+    """--study / --frames runs say they are partial, keep report.json/scene.json (the last full run),
+    and their Δprev never calls an issue of a skipped or differently sampled study "fixed"."""
+    mech = tmp_path / "two.mech"
+    code, out, _ = _run(capsys, "run", TWO, "--output-dir", tmp_path)
+    assert code == 2 and "FAIL interference post/arm" in out
+    saved = {f: (mech / f).read_bytes() for f in ("report.json", "scene.json")}
+
+    code, out, _ = _run(capsys, "run", TWO, "--study", "back", "--output-dir", tmp_path)
+    lines = out.splitlines()
+    assert code == 0 and lines[0].startswith("mech two — PASS (partial run: --study back, skipped sweep)   ")
+    dprev = next(line for line in lines if line.startswith("Δprev"))
+    assert dprev == "Δprev: no change (not compared: sweep (not run))"  # not "fixed interference arm/post"
+    assert lines[-1].startswith("view: not exported — partial run")
+    assert {f: (mech / f).read_bytes() for f in saved} == saved
+    partial = json.loads((mech / "report.partial.json").read_text(encoding="utf-8"))
+    assert partial["partial"] == {"studies": ["back"], "skipped": ["sweep"], "frames": None}
+    code, out, _ = _run(capsys, "list", "--output-dir", tmp_path)
+    assert out.split()[:2] == ["two", "FAIL"]  # the full run's status
+
+    # the same partial run again compares with the previous partial run in full
+    code, out, _ = _run(capsys, "run", TWO, "--study", "back", "-p", "post_r=35", "--output-dir", tmp_path)
+    assert "Δprev: params post_r 30→35" in out and "not compared" not in out
+
+    # a coarser sampling (0/30/60/90°) is not compared with the 19-frame run either; the sweep finds
+    # the hit between frames 1 and 2, and the issue gives the pose there, not a sampled frame's
+    code, out, _ = _run(capsys, "run", TWO, "--frames", "4", "--output-dir", tmp_path)
+    assert code == 2 and "(partial run: --frames 4)" in out.splitlines()[0]
+    assert "Δprev: no change (not compared: sweep (19→4 frames), back (19→4 frames))" in out
+    assert "· between f1–f2 j=45.0° [sweep]" in out
+    assert {f: (mech / f).read_bytes() for f in saved} == saved
+
+    # a full run replaces both files and drops the stale partial report
+    _run(capsys, "run", TWO, "-p", "post_r=35", "--output-dir", tmp_path)
+    assert not (mech / "report.partial.json").exists()
+    assert (mech / "report.json").read_bytes() != saved["report.json"]
+
+
+def test_partial_run_only_lists_as_partial(capsys, tmp_path):
+    _run(capsys, "run", TWO, "--study", "back", "--output-dir", tmp_path)
+    code, out, _ = _run(capsys, "list", "--output-dir", tmp_path)
+    assert code == 0 and out.split()[:2] == ["two", "PASS"] and "partial run only" in out
+
+
+def test_invalid_full_run_removes_the_stale_scene(capsys, tmp_path):
+    _run(capsys, "run", ARM, "--output-dir", tmp_path)
+    mech = tmp_path / "arm.mech"
+    assert (mech / "scene.json").is_file() and list((mech / "parts").glob("*.stl"))
+    code, _, _ = _run(capsys, "run", ARM, "-p", "bad_joint=True", "--output-dir", tmp_path)
+    assert code == 3
+    assert not (mech / "scene.json").exists() and not list((mech / "parts").glob("*.stl"))
+    code, _, err = _run(capsys, "shot", "arm", "--output-dir", tmp_path)
+    assert code == 3 and "the last run of arm.mech was INVALID" in err and "unknown parent part 'bsae'" in err
+
+
+def test_shot_refuses_a_stale_scene(capsys, tmp_path):
+    _run(capsys, "run", ARM, "--output-dir", tmp_path)
+    report_path = tmp_path / "arm.mech" / "report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["status"] = "FAIL"  # e.g. a report.json written by another run than scene.json
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    code, _, err = _run(capsys, "shot", "arm", "--output-dir", tmp_path)
+    assert code == 3 and "is stale" in err and "status PASS vs FAIL" in err
+
+
+def test_default_output_dir_is_the_repo_output(tmp_path, monkeypatch):
+    """`run(build())` from any working directory exports where the viewer and `mech shot` look; an
+    explicit other directory gets a shot hint that points at it."""
+    from mech.report import format_summary
+    from mech.runner import OUTPUT_DIR, analyze
+
+    assert OUTPUT_DIR == REPO / "output"
+    spec = importlib.util.spec_from_file_location("_cli_arm", ARM)
+    arm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(arm)
+    monkeypatch.chdir(tmp_path)
+    report = analyze(arm.build(label="zz_cwd_probe"), export=False)
+    assert report["out_dir"] is None and not (tmp_path / "output").exists()
+    report = analyze(arm.build(label="zz_cwd_probe"), out_root=tmp_path / "elsewhere")
+    assert report["out_dir"] == str((tmp_path / "elsewhere").resolve())
+    view = format_summary(report).splitlines()[-1]
+    assert view.endswith(f"shot: uv run mech shot zz_cwd_probe --output-dir {report['out_dir']}")
 
 
 def test_check(capsys, tmp_path):
@@ -146,18 +236,21 @@ def test_sweep_grid_and_table(capsys, tmp_path):
     assert code == 0
     lines = out.splitlines()
     assert lines[0] == "mech sweep arm.py — 6 variants"
-    assert lines[1].split() == ["swing", "need", "status", "F/W", "min", "clr", "worst", "SF", "swing"]
+    assert lines[1].split() == ["swing", "need", "status", "F/W", "min", "clr", "worst", "SF", "swing", "why"]
     rows = [line.split() for line in lines[2:8]]
     assert [(r[0], r[1], r[2], r[3]) for r in rows] == [
         ("30", "45", "FAIL", "1/0"), ("30", "60", "FAIL", "1/0"), ("60", "45", "PASS", "0/0"),
         ("60", "60", "PASS", "0/0"), ("90", "45", "PASS", "0/0"), ("90", "60", "PASS", "0/0")]
-    assert [r[-1] for r in rows] == ["30.0", "30.0", "60.0", "60.0", "90.0", "90.0"]  # target value column
+    assert [r[6] for r in rows] == ["30.0", "30.0", "60.0", "60.0", "90.0", "90.0"]  # target value column
+    assert [" ".join(r[7:]) for r in rows] == ["target_miss swing"] * 2 + [""] * 4  # why a row fails
     assert lines[8] == "best swing=60 need=45 — PASS (--export-best to export it)"
     assert not (tmp_path / "arm.mech").exists()
 
     code, out, _ = _run(capsys, "sweep", ARM, "need=100,120", "--export-best", "--frames", "4",
                         "--output-dir", tmp_path)
-    assert code == 2 and "best need=100 — FAIL · exported" in out
+    assert code == 2 and "best need=100 — FAIL · exported (full run at the declared frames)" in out
+    report = json.loads((tmp_path / "arm.mech" / "report.json").read_text(encoding="utf-8"))
+    assert report["partial"] is None and report["studies"][0]["frames"] == 10  # not the sweep's 4
     assert (tmp_path / "arm.mech" / "scene.json").is_file()
     code, _, err = _run(capsys, "sweep", ARM, "wobble=1,2", "--output-dir", tmp_path)
     assert code == 3 and "unknown param wobble" in err
@@ -244,3 +337,30 @@ def test_shot_takes_a_screenshot(capsys, tmp_path):
     assert png == (tmp_path / "arm.mech" / "shot_issue0.png").resolve()
     data = png.read_bytes()
     assert data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 5000
+
+
+def test_export_failure_is_one_line_without_traceback(capsys, tmp_path, monkeypatch):
+    import mech.export as ex
+
+    monkeypatch.setattr(ex, "export_stl", lambda shape, path, **kw: False)
+    code, out, err = _run(capsys, "run", ARM, "--output-dir", tmp_path)
+    assert code == 3 and out == ""
+    assert err.startswith("mech: export failed: could not write the STL of part '") and "Traceback" not in err
+    assert len(err.strip().splitlines()) == 1
+
+
+def test_verbose_run_prints_study_progress_on_stderr(capsys, tmp_path):
+    code, out, err = _run(capsys, "run", TWO, "--verbose", "--no-export", "--output-dir", tmp_path)
+    lines = err.strip().splitlines()
+    assert len(lines) == 2 and all(line.startswith("study ") and " frames … " in line and line.endswith(" s")
+                                   for line in lines)
+    code, out, err = _run(capsys, "run", TWO, "--no-export", "--output-dir", tmp_path)
+    assert err == ""  # not a terminal, not --verbose: quiet
+
+
+def test_sweep_ranks_a_missing_safety_factor_below_a_measured_one():
+    from mech.sweep import Variant, best_variant
+
+    rows = [Variant({"k": 1}, "PASS", min_clearance=1.0, worst_sf=None),
+            Variant({"k": 2}, "PASS", min_clearance=1.0, worst_sf=1.6)]
+    assert best_variant(rows).params == {"k": 2}

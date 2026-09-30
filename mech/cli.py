@@ -9,7 +9,8 @@
 Exit codes: PASS 0, WARN 1, FAIL 2, INVALID 3 (also: script errors and bad arguments).
 ``mech shot`` / ``mech list`` exit 0 on success, 3 on error. A model script defines
 ``build(**params) -> Assembly`` with every tunable as a keyword default; it is imported by path
-with its own directory and the repo root on ``sys.path``.
+with its own directory and the repo root on ``sys.path``. ``--study``/``--frames`` make a run
+partial: it never replaces the last full run's report.json/scene.json (see ``mech.runner``).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .assembly import Assembly
+from .export import ExportError
 from .geom import slug
 from .runner import analyze, check, ensure_utf8_stdio
 from .report import format_check, format_summary
@@ -135,9 +137,12 @@ def _build(build: Callable[..., Assembly], given: dict, script: Path, verbose: b
 
 
 def _guarded(fn: Callable[[], dict], script: Path, verbose: bool) -> dict:
-    """Run an analysis; an unexpected exception (e.g. from a drive callable) becomes a CliError."""
+    """Run an analysis; an unexpected exception (e.g. from a drive callable) becomes a CliError,
+    an export failure (a part's STL could not be written) a one-line one."""
     try:
         return fn()
+    except ExportError as exc:
+        raise CliError(f"export failed: {exc}") from None
     except Exception as exc:
         raise CliError(f"analysis failed:\n{_trimmed_traceback(exc, script, verbose)}") from None
 
@@ -150,7 +155,8 @@ def _cmd_run(args) -> int:
     build = _load_build(script, args.verbose)
     asm, params = _build(build, _parse_params(args.p), script, args.verbose)
     report = _guarded(lambda: analyze(asm, studies=args.study, frames=args.frames, export=not args.no_export,
-                                      out_root=args.output_dir, step=args.step, params=params), script, args.verbose)
+                                      out_root=args.output_dir, step=args.step, params=params,
+                                      progress=True if args.verbose else None), script, args.verbose)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=1, allow_nan=False))
     else:
@@ -183,12 +189,14 @@ def _cmd_sweep(args) -> int:
     best = best_variant(rows)
     chosen = " ".join(f"{k}={v!r}" for k, v in best.params.items())
     if args.export_best and best.status != "INVALID":
+        # exported as a full run (declared frame counts), so the scene/report match `mech run`
         asm, params = _build(build, best.params, script, args.verbose)
-        report = _guarded(lambda: analyze(asm, frames=args.frames, out_root=args.output_dir, params=params), script,
-                          args.verbose)
-        print(f"best {chosen} — {report['status']} · exported · view {report['viewer_url']}")
-    else:
-        print(f"best {chosen} — {best.status}" + ("" if args.export_best else " (--export-best to export it)"))
+        report = _guarded(lambda: analyze(asm, out_root=args.output_dir, params=params), script, args.verbose)
+        full = " (full run at the declared frames)" if args.frames is not None else ""
+        where = f"view {report['viewer_url']}" if not report.get("out_dir") else f"in {report['out_dir']}"
+        print(f"best {chosen} — {report['status']} · exported{full} · {where}")
+        return EXIT_CODES[report["status"]]
+    print(f"best {chosen} — {best.status}" + ("" if args.export_best else " (--export-best to export it)"))
     return EXIT_CODES[best.status]
 
 
@@ -209,11 +217,15 @@ def _cmd_list(args) -> int:
         if not d.is_dir():
             continue
         report_path = d / "report.json"
+        partial_only = not report_path.exists() and (d / "report.partial.json").exists()
+        if partial_only:  # only --study/--frames runs so far: say so, never pass it off as the full run
+            report_path = d / "report.partial.json"
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
             status = report.get("status", "?")
             sevs = [i.get("severity") for i in report.get("issues", [])]
             detail = f"{sevs.count('FAIL')} FAIL · {sevs.count('WARN')} WARN"
+            detail += " · partial run only" if partial_only else ""
             mtime = report_path.stat().st_mtime
         except (OSError, ValueError, AttributeError):
             status, detail, mtime = "?", "no readable report.json", d.stat().st_mtime
@@ -259,8 +271,9 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="analyze a model script and print the summary")
     script_args(p)
-    p.add_argument("--study", action="append", metavar="NAME", help="run only this study (repeatable)")
-    p.add_argument("--frames", type=int, help="override every study's frame count")
+    p.add_argument("--study", action="append", metavar="NAME",
+                   help="run only this study (repeatable); partial run: not exported")
+    p.add_argument("--frames", type=int, help="override every study's frame count; partial run: not exported")
     p.add_argument("--no-export", action="store_true", help="don't write output/<name>.mech/")
     p.add_argument("--step", action="store_true", help="also export assembly.step")
     p.add_argument("--json", action="store_true", help="print report.json instead of the summary")
@@ -274,7 +287,8 @@ def _parser() -> argparse.ArgumentParser:
     script_args(p, params=False)
     p.add_argument("axes", nargs="+", metavar="K=A:B:STEP|K=V1,V2", help="grid axis")
     p.add_argument("--frames", type=int, help="override every study's frame count")
-    p.add_argument("--export-best", action="store_true", help="export the best variant for the viewer")
+    p.add_argument("--export-best", action="store_true",
+                   help="export the best variant for the viewer (a full run at the declared frames)")
     p.set_defaults(func=_cmd_sweep)
 
     p = sub.add_parser("shot", help="headless screenshot of output/<name>.mech (needs playwright)")

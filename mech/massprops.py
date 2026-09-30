@@ -6,6 +6,7 @@ Density ρ in g/cm³ becomes kg/mm³ as ρ·1e-6.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,9 +16,11 @@ from OCP.GProp import GProp_GProps
 
 from .geom import vec3
 
-__all__ = ["MassProps", "part_props", "assembly_props"]
+__all__ = ["MassProps", "part_props", "assembly_props", "solid_body"]
 
 _OVERLAP_RTOL = 1e-3  # fuse when Σ solid volumes exceeds the fused volume by more than 0.1 %
+_BODY_CACHE_SIZE = 256  # solid_body results kept (mass props and clearance share them)
+_body_cache: OrderedDict[int, tuple[object, object]] = OrderedDict()
 
 
 @dataclass
@@ -32,14 +35,30 @@ def _boxes_overlap(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.nda
     return bool(np.all(a[0] <= b[1]) and np.all(b[0] <= a[1]))
 
 
-def _solid_body(shape):
-    """The shape whose volume properties are right: overlapping solids fused, non-solids dropped.
+def solid_body(shape):
+    """The solid material of ``shape``: overlapping solids fused, non-solids (faces, shells) dropped.
 
     ``None`` when the shape has no solids (zero volume). OCC integrates a compound solid by
-    solid, so overlapping solids would be counted twice; they are fused first (only when some
-    pair of solid bounding boxes actually overlaps, to skip the boolean in the common case).
+    solid and its booleans treat a compound's solids as separate arguments, so overlapping
+    solids (a list-of-shapes part, overlapping library sub-bodies) would be counted twice in
+    volumes and break interference booleans; they are fused first (only when some pair of solid
+    bounding boxes actually overlaps, to skip the boolean in the common case). Results are
+    cached per shape object, so mass properties and the clearance checker fuse a part once.
     """
-    solids = shape.solids()
+    key = id(shape)
+    hit = _body_cache.get(key)
+    if hit is not None and hit[0] is shape:
+        _body_cache.move_to_end(key)
+        return hit[1]
+    body = _fuse_overlapping(shape)
+    _body_cache[key] = (shape, body)
+    while len(_body_cache) > _BODY_CACHE_SIZE:
+        _body_cache.popitem(last=False)
+    return body
+
+
+def _fuse_overlapping(shape):
+    solids = shape.solids() if hasattr(shape, "solids") else []
     if not solids:
         return None
     if len(solids) == 1:
@@ -69,7 +88,7 @@ def _unit_density_props(shape) -> tuple[float, np.ndarray, np.ndarray]:
 
 def part_props(part) -> MassProps:
     """Mass properties of a ``Part`` at home; ``part.mass_g`` rescales mass and inertia."""
-    body = _solid_body(part.shape)
+    body = solid_body(part.shape)
     vol, com, J = (0.0, None, np.zeros((3, 3))) if body is None else _unit_density_props(body)
     if vol <= 0:  # no solid material: a massless (or, with mass_g, point-mass) marker at the bbox center
         bb = part.shape.bounding_box()

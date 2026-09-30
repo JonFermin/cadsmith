@@ -251,3 +251,19 @@ def test_circle_intersect():
         circle_intersect((0, 0, 0), 1, (10, 0, 0), 2)
     with pytest.raises(ValueError):
         circle_intersect((0, 0, 0), 1, (0, 0, 0), 1)
+
+
+def test_inside_classifies_each_solid_of_a_compound():
+    """OCC's classifier on a multi-solid compound calls interior points of later solids outside;
+    ``inside`` tests every solid (review p5d: library bearings, motors, list-of-shapes parts)."""
+    from build123d import Compound, Plane, Rectangle
+
+    from mech.geom import inside
+    from mech.parts import bearing
+
+    two = Compound([Box(10, 10, 10), Pos(20, 0, 0) * Box(10, 10, 10)])
+    assert inside(two, (0, 0, 0)) and inside(two, (20, 0, 0)) and inside(two, (5, 0, 0))  # boundary counts
+    assert not inside(two, (10, 0, 0))
+    ring = bearing("608").shape  # three touching solids; (10, 0, 0) lies in the outer ring
+    assert not ring.is_inside(Vector(10, 0, 0)) and inside(ring, (10, 0, 0))
+    assert not inside(Plane.XY * Rectangle(10, 10), (0, 0, 0))  # no solid, nothing inside

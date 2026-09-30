@@ -24,17 +24,44 @@ async function fetchOk(url, what) {
   return res;
 }
 
-/** @returns {Promise<{scene: object, report: object, base: string}>} */
+/** report.json of a mech, or null when it is missing/unreadable. */
+async function tryReport(base) {
+  try {
+    return await (await fetchOk(outputUrl(`${base}report.json`), 'report.json')).json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Load scene.json (+ its report). The scene must show the last run: after an INVALID run there
+ * is none (report.json names the error), and a scene whose embedded report differs from
+ * report.json is stale — both are errors rather than an old model shown as current.
+ * @returns {Promise<{scene: object, report: object, base: string}>}
+ */
 export async function loadMech(slug) {
   if (!/^[A-Za-z0-9_.-]+$/.test(slug)) throw new Error(`bad m=${slug}: expected a mech slug`);
   const base = `${slug}.mech/`;
-  const res = await fetchOk(outputUrl(`${base}scene.json`), `mech '${slug}' not found`);
+  let res;
+  try {
+    res = await fetchOk(outputUrl(`${base}scene.json`), `mech '${slug}' not found`);
+  } catch (err) {
+    const last = await tryReport(base);
+    if (last?.status === 'INVALID') {
+      const first = last.issues?.[0]?.message || 'invalid model';
+      throw new Error(`mech '${slug}': the last run was INVALID (${first}) — fix the model and re-run`);
+    }
+    throw err;
+  }
   const scene = await res.json();
   if (scene.version !== 1) throw new Error(`unsupported scene.json version ${scene.version}`);
-  let report = scene.report;
-  if (!report) {
-    report = await (await fetchOk(outputUrl(`${base}report.json`), 'report.json')).json();
+  const saved = await tryReport(base);
+  if (saved && scene.report && JSON.stringify(saved) !== JSON.stringify(scene.report)) {
+    throw new Error(`mech '${slug}': scene.json is stale (report.json says ${saved.status}, the scene `
+      + `${scene.report.status}) — re-run \`uv run mech run\``);
   }
+  const report = scene.report || saved;
+  if (!report) throw new Error(`mech '${slug}': report.json missing`);
   return { scene, report, base };
 }
 

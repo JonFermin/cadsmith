@@ -134,3 +134,18 @@ def test_default_material_is_pla():
     asm.part("b", Box(10, 10, 10), ground=True)
     assert part_props(asm.parts["b"]).mass_kg == pytest.approx(1.24e-6 * 1000)
     assert math.isclose(assembly_props(asm).mass_kg, 1.24e-3)
+
+
+def test_solid_body_is_fused_cached_and_drops_non_solids():
+    """The clearance checker measures the same fused body the mass properties use."""
+    from mech.massprops import solid_body
+
+    overlap = Compound([Box(10, 10, 10), Pos(5, 0, 0) * Box(10, 10, 10)])
+    body = solid_body(overlap)
+    assert body.volume == pytest.approx(1500.0, rel=1e-9) and len(body.solids()) == 1
+    assert solid_body(overlap) is body  # cached per shape object
+    touching = Compound([Box(10, 10, 10), Pos(10, 0, 0) * Box(10, 10, 10)])
+    assert sum(s.volume for s in solid_body(touching).solids()) == pytest.approx(2000.0, rel=1e-9)
+    assert solid_body(Plane.XY * Rectangle(10, 10)) is None
+    mixed = Compound([Box(10, 10, 10), Pos(0, 0, 20) * (Plane.XY * Rectangle(10, 10)).face()])
+    assert solid_body(mixed).volume == pytest.approx(1000.0, rel=1e-9) and len(solid_body(mixed).faces()) == 6

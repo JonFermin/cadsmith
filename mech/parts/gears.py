@@ -134,7 +134,7 @@ def spur_gear(module: float, teeth: int, width: float, *, bore: float = 0, backl
     bom = f"Spur gear m{module:g} z{teeth} x {width:g} mm, {pressure_angle:g} deg PA"
     if bore > 0:
         bom += f", bore {bore:g}"
-    return LibPart(shape, bom, None, {"axis": z_frame()})
+    return LibPart(shape, bom, None, {"axis": z_frame()}, kind="gear")
 
 
 class GearPair(NamedTuple):
@@ -190,7 +190,7 @@ def rack(module: float, length: float, width: float, height: float, *, backlash:
     outline = [(x0, -height)] + top + [(x1, -height)]
     shape = assemble(prism(outline, width))
     bom = f"Rack m{module:g} {length:g} x {width:g} x {height + _ADDENDUM * m:g} mm"
-    return LibPart(shape, bom, None, {"pitch": z_frame()})
+    return LibPart(shape, bom, None, {"pitch": z_frame()}, kind="rack")
 
 
 def _gt2_outline(teeth: int) -> list[tuple[float, float]]:
@@ -235,4 +235,5 @@ def gt2_pulley(teeth: int, width: float, bore: float) -> LibPart:
         tube(flange_d, bore, GT2_FLANGE_T, GT2_FLANGE_T + width),
     )
     frames = {"axis": z_frame(), "belt": z_frame(z=GT2_FLANGE_T + width / 2)}
-    return LibPart(body, f"GT2 pulley {teeth}T {width:g} mm belt, bore {bore:g}", None, frames)
+    return LibPart(body, f"GT2 pulley {teeth}T {width:g} mm belt, bore {bore:g}", None, frames,
+                   kind="pulley")

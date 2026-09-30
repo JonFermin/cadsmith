@@ -41,6 +41,8 @@ Skip questions about colors, file formats, or anything with a sane default.
 | lead screw carriage on linear rods | `examples/leadscrew_stage.py` |
 | actuator lifting a payload (loads, SF) | `examples/pendulum_arm.py` |
 | lids/doors on hinges, clearance at closure | `examples/hinged_box.py` |
+| servo gripper: gear pair + parallelogram jaws, callable target on per-frame transforms | `examples/parallel_gripper.py` |
+| lead-screw driven scissor lift (multi-loop linkage, payload, motor SF) | `examples/scissor_lift.py` |
 
 Copy it to `output/<name>.py` and adapt. Rules that matter most (details in the reference):
 - `def build(<every tunable as a keyword default>) -> Assembly` and the
@@ -51,8 +53,10 @@ Copy it to `output/<name>.py` and adapt. Rules that matter most (details in the 
   (`revolute`/`prismatic`/`fix`). Close loops with `pin`, never a second joint.
 - Choose each joint axis so **+value means the natural direction** (open, raise, extend).
 - Put intent in the script: `actuator` (capacity), `study` (what to sweep), `target`
-  (requirements), `probe` (points whose path you care about), `allow_contact` for nominal
-  line-to-line fits between parts that are not joined.
+  (requirements), `probe` (points whose path you care about), `allow_contact` for nominal fits
+  between parts the joint doesn't carry (overlaps deeper than max_depth=0.1 mm still interfere;
+  max_depth=None for belts on pulleys); `check_clearance` when a joined pair's far-from-hinge near
+  miss matters. Belt/chain drives: `belt(j_motor, j_out, t_motor, t_out)`, not `gear`.
 - Prefer `mech.parts` (motors, bearings, gears, screws, rods, extrusions) with their `frames`
   (`at=motor.frames["shaft"]`) over hand-modeled stand-ins.
 
@@ -69,26 +73,37 @@ Exit codes: **0 PASS · 1 WARN · 2 FAIL · 3 INVALID/error**. Read the summary 
 ```
 mech pendulum_arm — FAIL   3 parts · 2 joints (1 driver, 1 fixed) · 178 g · CoG (70.8, −11.0, 0)
 FAIL over_capacity j_shoulder holding load 0.129 N·m @f18 (j_shoulder=0°) exceeds capacity 0.1 (SF 0.774) — bigger actuator, gearing, or counterbalance
-FAIL target_miss servo margin: sf:j_shoulder 0.774 < min 2
+FAIL target_miss servo margin: sf:j_shoulder 0.774 < min 2 (margin −1.23)
 OK   open chain (no loops) · mobility 0
+clearance min 91.0 mm (servo/payload @f12 j_shoulder=−30.0°) · required 0.3 · 2 pairs checked
 load j_shoulder max 0.129 N·m @f18 · capacity 0.1 → SF 0.774
 targets 0/1
 ranges j_shoulder −90.0…90.0° · probe tip Δ(130, 0, 260) path 408 mm
-Δprev: status PASS→FAIL · new over_capacity arm, target_miss servo margin · servo margin 8.36→0.774
+Δprev: status PASS→FAIL · params capacity 1.08→0.1 · new over_capacity j_shoulder, target_miss servo margin · servo margin 8.36→0.774
 view http://localhost:3000/mech.html?m=pendulum_arm&issue=0&ui=0 · shot: uv run mech shot pendulum_arm
 ```
 
 Line order: header (status, counts, mass, CoG) · FAIL · target_miss · WARN · INFO · loop line
-(`OK loop p_B closed (max 7e-14 mm) · no branch jumps · mobility 0`; `!!` = open loop or
-leftover mobility) · loads (max holding load, frame, capacity → SF) · targets · ranges (joints,
-probe Δ and path) · Δprev · view.
+(`OK loop p_B closed (max 7e-14 mm) · no branch jumps · mobility 0`; `!!` = open loop, branch
+jump, singular frame or leftover mobility) · clearance (always: min gap — negative = overlap
+depth —, the pair, frame and driver values, required gap, pairs checked, allowed-contact pairs —
+quote it when presenting) · loads (max holding load, frame, capacity → SF; `no gravity load on …`
+when every axis is ∥ g) · targets (met ones, then `not evaluated: …`) · ranges (joints, probe Δ
+and path, closed frames only) · Δprev · view.
 
 - Issue lines carry the numbers you need (overlap volume/extent/location, gap + direction,
-  failing drive sub-range, offending frame and joint values). Act on them directly — see
+  failing drive sub-range, offending frame and the values of every driver that moves the pair).
+  A `target_miss` names the bound and the signed margin. Act on them directly — see
   "Issue codes" in the reference for the usual fix per code.
-- `Δprev` tells you whether the last edit helped. `(+N more … — --verbose)` means lines were
-  cut; rerun with `--verbose` only if the hidden ones matter.
+- `Δprev` tells you whether the last edit helped: status, changed params, fixed/new issues,
+  added/removed targets, min clearance, mass, target values. It compares only studies both runs
+  sampled alike and says what it left out (`not compared: sweep (not run)`). `(+N more … —
+  --verbose)` means lines were cut; rerun with `--verbose` only if the hidden ones matter.
 - `INVALID` lists every model error in one pass with did-you-mean hints; fix all, rerun.
+- `--study NAME` / `--frames N` runs are **partial**: the header says so (`PASS (partial run:
+  --study tilt, skipped pan)`), targets that depend on skipped studies are `not evaluated`, and
+  nothing is exported — `output/<name>.mech/` keeps the last full run for the viewer, `mech shot`,
+  `mech list` and the next Δprev. A partial PASS is not a design PASS: finish with a full run.
 
 ## 4. Iterate (cap: 6 runs)
 
@@ -101,8 +116,8 @@ or geometry) → rerun → confirm via `Δprev`. Typical moves:
 
 Use `uv run mech sweep output/<name>.py k=a:b:step k2=v1,v2` (inclusive ranges, grid ≤ 50
 variants, no export) when the right value isn't obvious: one row per variant (status, F/W
-counts, min clearance, worst SF, each target value) plus a `best …` line — far cheaper than
-successive runs. `--export-best` exports the winner.
+counts, min clearance, worst SF, each target value, `why` = first failing code + subject) plus a
+`best …` line — far cheaper than successive runs. `--export-best` exports the winner as a full run.
 
 Stop when PASS with targets met (WARNs explained or accepted), or after 6 runs: then report
 what still fails, why, and the options — don't keep guessing.
@@ -121,8 +136,9 @@ Interactive viewer for the user: `cd previewer && npm run dev`, then open the `v
 ## 6. Present the result
 
 Keep it short:
-1. **Status** and the few numbers that answer the user's question (travel/swing, min
-   clearance, peak holding load and SF, mass), each target with its margin.
+1. **Status** (of a full run, never a `--study`/`--frames` one) and the few numbers that answer
+   the user's question (travel/swing, min clearance from the clearance line, peak holding load and
+   SF, mass), each target with its margin.
 2. What you changed across iterations and why (one line each), and any accepted WARN.
 3. A screenshot if you took one, the viewer URL (needs `npm run dev`), and the files:
    `output/<name>.py` (source of truth) and `output/<name>.mech/` (scene, report, STLs;

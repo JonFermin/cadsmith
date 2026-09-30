@@ -2,7 +2,7 @@
 import {
   ArrowHelper, BoxGeometry, BufferGeometry, Color, CylinderGeometry, DoubleSide, EdgesGeometry,
   Group, Line, LineBasicMaterial, LineSegments, Matrix4, Mesh, MeshBasicMaterial, PlaneGeometry,
-  Quaternion, SphereGeometry, TorusGeometry, Vector3,
+  Quaternion, SphereGeometry, TorusGeometry, Vector3, Vector4,
 } from 'three';
 import { STATUS_COLORS } from './parts.js';
 import { fmt } from './model.js';
@@ -11,7 +11,45 @@ const PROBE_COLORS = [0x4dd0e1, 0xf06292, 0xffd54f, 0xa5d6a7, 0xb39ddb, 0xffab91
 const Y = new Vector3(0, 1, 0);
 
 /** Marker material: always drawn on top so an issue is visible through the parts around it. */
-const onTop = color => new MeshBasicMaterial({ color, depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
+const onTop = (color, opacity = 0.95) => new MeshBasicMaterial({ color, depthTest: false, depthWrite: false, transparent: true, opacity });
+
+// Issue and probe markers keep a fixed size on screen (CSS px) in every pane, whatever the scene
+// size or zoom, and are see-through: a marker must point at an overlap, never hide it.
+const MARKER_PX = 5;
+const MARKER_OPACITY = 0.5;
+const _vp = new Vector4();
+const _pos = new Vector3();
+
+/** World length of one CSS pixel at `pos` for `camera`, in the renderer's current viewport. */
+function worldPerPixel(renderer, camera, pos) {
+  renderer.getViewport(_vp);
+  const h = Math.max(_vp.w, 1);
+  if (camera.isOrthographicCamera) return (camera.top - camera.bottom) / camera.zoom / h;
+  const depth = Math.abs(_pos.copy(pos).applyMatrix4(camera.matrixWorldInverse).z);
+  return (2 * depth * Math.tan((camera.fov * Math.PI) / 360)) / h;
+}
+
+/**
+ * Rescale `obj` (unit-sized geometry) to `px` screen pixels right before each camera draws it;
+ * `radial` scales only X/Z (a cylinder along its Y axis keeps its length).
+ */
+function screenSized(obj, px, radial = false) {
+  obj.frustumCulled = false; // its bounding sphere follows the last camera's scale
+  obj.onBeforeRender = (renderer, _scene, camera) => {
+    const k = px * worldPerPixel(renderer, camera, obj.getWorldPosition(new Vector3()));
+    if (radial) obj.scale.set(k, 1, k);
+    else obj.scale.setScalar(k);
+    obj.updateMatrixWorld();
+  };
+  return obj;
+}
+
+/** A see-through dot `px` pixels in radius at `pos`. */
+function dot(pos, color, px, opacity = MARKER_OPACITY) {
+  const m = new Mesh(new SphereGeometry(1, 16, 12), onTop(color, opacity));
+  m.position.copy(pos);
+  return screenSized(m, px);
+}
 
 function el(cls, text) {
   const e = document.createElement('div');
@@ -53,26 +91,28 @@ class Layer {
 /** Clearance problems at the current pose: segment + spheres pa→pb, optional overlap box. */
 export class IssueMarkers extends Layer {
   /**
+   * Markers are drawn at a fixed screen size (MARKER_PX, 1.5× when selected) and see-through, so
+   * they point at a small overlap without covering it; the selected issue's overlap box is drawn
+   * at its true extent.
    * @param {{a, b, status, pa, pb, distance, volume}[]} entries  scene.json issue entries
    * @param {object} opts  {offsetOf(id) → Vector3, size: mm, selected?: {entry?, box?: {center, size}, text}}
    */
   set(entries, { offsetOf, size, selected = null }) {
     this.clear();
-    const r = size * 0.008;
+    const r = size * 0.002; // only the smallest overlap box drawn (a zero extent stays visible)
     for (const e of entries) {
       if (e.status !== 'interference' && e.status !== 'tight') continue;
       const isSel = selected?.entry === e;
       const color = STATUS_COLORS[e.status];
       const pa = new Vector3(...e.pa).add(offsetOf(e.a));
       const pb = new Vector3(...e.pb).add(offsetOf(e.b));
-      const k = isSel ? 1.6 : 1;
+      const px = MARKER_PX * (isSel ? 1.5 : 1);
       for (const p of [pa, pb]) {
-        const s = new Mesh(new SphereGeometry(r * k, 16, 12), onTop(color));
-        s.position.copy(p);
+        const s = dot(p, color, px, isSel ? 0.65 : MARKER_OPACITY);
         s.renderOrder = 10;
         this.group.add(s);
       }
-      if (pa.distanceTo(pb) > 1e-6) this.group.add(this._segment(pa, pb, r * 0.35 * k, color));
+      if (pa.distanceTo(pb) > 1e-6) this.group.add(this._segment(pa, pb, px * 0.35, color));
       if (isSel) {
         const text = e.status === 'interference'
           ? `interference ${fmt(e.volume)} mm³ · ${e.a} / ${e.b}`
@@ -83,13 +123,13 @@ export class IssueMarkers extends Layer {
     if (selected?.box) this._box(selected.box, selected.status || 'interference', r, selected.text, !selected.entry);
   }
 
-  _segment(a, b, radius, color) {
+  _segment(a, b, px, color) {
     const len = a.distanceTo(b);
-    const m = new Mesh(new CylinderGeometry(radius, radius, len, 10), onTop(color));
+    const m = new Mesh(new CylinderGeometry(1, 1, len, 10), onTop(color, 0.8));
     m.position.copy(a).add(b).multiplyScalar(0.5);
     m.quaternion.copy(new Quaternion().setFromUnitVectors(Y, b.clone().sub(a).normalize()));
     m.renderOrder = 10;
-    return m;
+    return screenSized(m, px, true);
   }
 
   /** Overlap extent box (report issue `extent` at `location`); labelled when there is no pa/pb. */
@@ -100,13 +140,19 @@ export class IssueMarkers extends Layer {
     const place = new Matrix4().copy(matrix).multiply(new Matrix4().makeTranslation(center.x, center.y, center.z));
     const fill = new Mesh(geom, new MeshBasicMaterial({ color, transparent: true, opacity: 0.22, depthTest: false, depthWrite: false }));
     const edges = new LineSegments(new EdgesGeometry(geom), new LineBasicMaterial({ color, depthTest: false, transparent: true }));
-    for (const o of withLabel ? [fill, edges, new Mesh(new SphereGeometry(r * 1.4, 16, 12), onTop(color))] : [fill, edges]) {
+    for (const o of [fill, edges]) {
       o.matrixAutoUpdate = false;
       o.matrix.copy(place);
       o.renderOrder = 10;
       this.group.add(o);
     }
-    if (withLabel && text) this.label(center.clone().applyMatrix4(matrix), status, text);
+    const at = center.clone().applyMatrix4(matrix);
+    if (withLabel) {
+      const d = dot(at, color, MARKER_PX * 1.5, 0.65);
+      d.renderOrder = 10;
+      this.group.add(d);
+      if (text) this.label(at, status, text);
+    }
   }
 }
 
@@ -124,11 +170,10 @@ export class ProbePaths extends Layer {
       line.renderOrder = 8;
       this.group.add(line);
       const f = frame === null ? 0 : frame;
-      const dot = new Mesh(new SphereGeometry(size * 0.008, 14, 10), onTop(color));
-      dot.position.copy(points[Math.min(f, points.length - 1)]);
-      dot.renderOrder = 9;
-      this.group.add(dot);
-      this.label(dot.position, 'probe', name).el.style.setProperty('--c', color.getStyle());
+      const at = dot(points[Math.min(f, points.length - 1)], color, MARKER_PX, 0.9);
+      at.renderOrder = 9;
+      this.group.add(at);
+      this.label(at.position, 'probe', name).el.style.setProperty('--c', color.getStyle());
     });
   }
 }

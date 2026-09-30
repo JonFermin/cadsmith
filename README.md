@@ -60,6 +60,7 @@ and a ~10-line summary. Out of scope: dynamics, friction, FEA.
 uv sync                                          # Python 3.12 env (build123d, numpy, scipy)
 uv run mech run examples/four_bar.py             # analyze + export output/four_bar.mech/
 uv run mech run examples/hinged_box.py -p gap=-1 # override build() params
+uv run mech run examples/scissor_lift.py --frames 12   # quick partial run (not exported)
 uv run mech check examples/gear_train.py         # validate + home-pose clearance, no studies
 uv run mech sweep examples/four_bar.py crank=30:45:5   # parameter grid, one row per variant
 uv run mech shot four_bar --ghost 6 --layout quad      # headless PNG (needs playwright)
@@ -70,7 +71,8 @@ uv run pytest                                    # test suite (analytic checks)
 ```
 mech four_bar — PASS   4 parts · 3 joints (1 driver, 2 passive) · 1 loop · 42.4 g · CoG (60.8, 22.5, 3.6)
 OK   loop p_B closed (max 6.96e-14 mm) · no branch jumps · mobility 0
-load j_crank max 0 N·m @f0 · capacity 0.5 → SF ∞
+clearance min 13.0 mm (frame/coupler @f0 j_crank=0°) · required 0.3 · 6 pairs checked
+no gravity load on j_crank (axis ∥ g or balanced)
 targets 1/1 · rocker swing span:j_rocker 62.1 ≥ 40
 ranges j_crank 0…360° · j_coupler −360…0° · j_rocker −13.2…48.9° · probe mid Δ(71.1, 58.0, 0) path 197 mm
 Δprev: first run
@@ -78,10 +80,15 @@ view http://localhost:3000/mech.html?m=four_bar&ghost=6&layout=quad&ui=0 · shot
 ```
 
 Exit codes: PASS 0, WARN 1, FAIL 2, INVALID/error 3. Units: mm, degrees, g, N·m / N; Z up.
+`--study`/`--frames` runs are partial: the header says so, targets that need a skipped study are
+"not evaluated", and `output/<name>.mech/` keeps the last full run (what `list`, `shot` and the
+viewer show).
 
 - **Examples** (`examples/`): `four_bar`, `slider_crank`, `gear_train` (NEMA 17 + 15:30 gears +
   625 bearing), `leadscrew_stage` (T8 screw, LM8UU carriage), `pendulum_arm` (MG996R servo,
-  payload, safety-factor target), `hinged_box` (two lids; `gap` drives tight vs interference).
+  payload, safety-factor target), `hinged_box` (two lids; `gap` drives tight vs interference),
+  `parallel_gripper` (SG90 + gear pair + parallelogram jaws that must stay parallel),
+  `scissor_lift` (NEMA 17 + T8 screw driving a two-stage scissor, payload, motor SF).
   Each is checked against closed-form truth in `tests/test_examples.py`.
 - **Standard parts** (`mech.parts`): NEMA 17/23, SG90/MG996R/N20 motors, ball and linear
   bearings, involute spur gears/gear pairs/racks, GT2 pulleys, rods, T8 screw and nut, 2020/2040

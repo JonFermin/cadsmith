@@ -24,7 +24,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 from .geom import slug
 
-__all__ = ["ShotError", "shot", "resolve_name", "build_query", "dist_is_current", "ensure_dist", "serve",
+__all__ = ["ShotError", "shot", "resolve_name", "build_query", "check_scene", "dist_is_current", "ensure_dist", "serve",
            "VIEWS"]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -152,6 +152,28 @@ def _read_report(mech: Path) -> dict | None:
         return None
 
 
+def check_scene(mech: Path, report: dict | None) -> None:
+    """``ShotError`` unless ``mech/scene.json`` shows the last run: the last run was INVALID (no
+    scene), there is no scene, or scene.json embeds another report than report.json (stale)."""
+    if report is not None and report.get("status") == "INVALID":
+        first = next((i.get("message") for i in report.get("issues") or []), "")
+        raise ShotError(f"the last run of {mech.name} was INVALID ({first}) — nothing to render; fix the model and "
+                        f"re-run `uv run mech run <script.py>`")
+    scene_path = mech / "scene.json"
+    if not scene_path.is_file():
+        raise ShotError(f"no scene at {mech} — run `uv run mech run <script.py>` first (`uv run mech list` shows "
+                        f"what exists)")
+    if report is not None:
+        try:
+            embedded = json.loads(scene_path.read_text(encoding="utf-8")).get("report")
+        except (OSError, ValueError, AttributeError):
+            embedded = None
+        if embedded != report:
+            raise ShotError(f"{scene_path} is stale: it does not match report.json (status "
+                            f"{(embedded or {}).get('status', '?')} vs {report.get('status', '?')}) — re-run "
+                            f"`uv run mech run <script.py>`")
+
+
 def shot(name: str, *, issue: int | None = None, view: str | None = None, ghost: int | None = None,
          layout: str | None = None, frame: int | None = None, out: Path | str | None = None,
          output_dir: Path = REPO_ROOT / "output", previewer: Path = REPO_ROOT / "previewer",
@@ -162,10 +184,9 @@ def shot(name: str, *, issue: int | None = None, view: str | None = None, ghost:
     if layout is not None and layout != "quad":
         raise ShotError(f"bad layout '{layout}': only 'quad' is supported")
     s, mech = resolve_name(name, output_dir)
-    if not (mech / "scene.json").is_file():
-        raise ShotError(f"no scene at {mech} — run `uv run mech run <script.py>` first (`uv run mech list` shows "
-                        f"what exists)")
-    query = build_query(s, _read_report(mech), issue=issue, view=view, ghost=ghost, layout=layout, frame=frame)
+    report = _read_report(mech)
+    check_scene(mech, report)
+    query = build_query(s, report, issue=issue, view=view, ghost=ghost, layout=layout, frame=frame)
     path = Path(out) if out is not None else mech / f"shot_{_suffix(query)}.png"
     try:
         from playwright.sync_api import Error as PlaywrightError

@@ -118,3 +118,53 @@ def test_slugged_names_stale_files_and_step(tmp_path):
     assert scene["studies"][0]["transforms"].keys() == {"con", "a/b:c"}  # the fixed child moves with its parent
     analyze(asm, out_root=tmp_path)  # a later run without step drops the now-stale STEP
     assert not (out / "assembly.step").exists()
+
+
+def test_partial_runs_write_only_report_partial_json(tmp_path, four_bar):
+    """scene.json/report.json always hold the last full run: a --study/--frames run writes
+    report.partial.json only; the next full run replaces both and drops the partial report."""
+    from conftest import make_four_bar
+
+    analyze(four_bar, out_root=tmp_path, step=True)
+    out = tmp_path / "four_bar.mech"
+    before = {p.name: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    partial = analyze(make_four_bar(), studies=["turn"], frames=12, out_root=tmp_path)
+    assert partial["partial"] == {"studies": ["turn"], "skipped": [], "frames": 12}
+    assert partial["viewer_url"] is None
+    after = {p.name: p.read_bytes() for p in out.rglob("*") if p.is_file() and p.name != "report.partial.json"}
+    assert after == before  # STLs, STEP, scene.json and report.json untouched
+    assert _strict_load(out / "report.partial.json") == partial
+    assert read_report(tmp_path, "four_bar", partial=True) == partial
+    full = analyze(make_four_bar(), out_root=tmp_path)
+    assert full["partial"] is None and not (out / "report.partial.json").exists()
+    assert full["delta_prev"] == {}  # compared with the previous full run, not the partial one
+
+
+def test_invalid_full_run_clears_the_scene(tmp_path, four_bar):
+    from mech.export import clear_scene
+
+    analyze(four_bar, out_root=tmp_path, step=True)
+    out = tmp_path / "four_bar.mech"
+    four_bar.revolute("j_bad", "fram", "crank", origin=(0, 0, 0), axis=(0, 0, 1))  # INVALID: unknown parent
+    report = analyze(four_bar, out_root=tmp_path)
+    assert report["status"] == "INVALID"
+    assert sorted(p.name for p in out.iterdir()) == ["parts", "report.json"]
+    assert list((out / "parts").iterdir()) == [] and _strict_load(out / "report.json") == report
+    clear_scene(tmp_path, "nothing_there")  # a mech that was never exported: no error
+
+
+def test_stl_failure_is_an_export_error_without_leftovers(tmp_path, four_bar, monkeypatch):
+    """export_stl raising (or reporting failure) names the part and leaves no *.tmp.stl behind."""
+    import mech.export as ex
+
+    def broken(shape, path, **kw):
+        Path(path).write_bytes(b"half a file")
+        raise RuntimeError("tessellation failed")
+
+    monkeypatch.setattr(ex, "export_stl", broken)
+    with pytest.raises(ex.ExportError, match=r"could not write the STL of part 'frame' \(RuntimeError: tessellation"):
+        analyze(four_bar, out_root=tmp_path)
+    monkeypatch.setattr(ex, "export_stl", lambda shape, path, **kw: False)
+    with pytest.raises(ex.ExportError, match=r"part 'frame' \(export_stl failed\)"):
+        analyze(four_bar, out_root=tmp_path)
+    assert list((mech_dir(tmp_path, "four_bar") / "parts").glob("*.stl")) == []

@@ -2,7 +2,9 @@
 
 Axes are ``k=a:b:step`` (inclusive numeric range) or ``k=v1,v2,...`` / ``k=v`` (literal values).
 The grid is the product of the axes, capped at 50 variants. Variants are analyzed without
-export; the table shows params | status | #FAIL/#WARN | min clearance | worst SF | each target.
+export; the table shows params | status | #FAIL/#WARN | min clearance | worst SF | each target |
+why (the first FAIL/WARN issue: code and subject). An actuator that holds no load has SF ∞, as
+in ``mech run``; ``–`` means no value (no rated actuator, nothing measured).
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .assembly import Assembly
-from .report import sig
+from .report import issue_key, sig
 from .runner import analyze
 
 __all__ = ["MAX_VARIANTS", "MAX_ROWS", "Variant", "parse_value", "parse_axis", "grid", "run_sweep",
@@ -88,19 +90,43 @@ class Variant:
     targets: dict[str, float | None] = field(default_factory=dict)
     error: str | None = None  # build() raised
     report: dict | None = None
+    why: str | None = None  # first FAIL/WARN issue: "code subject"
+
+
+def _sf(entry: dict) -> float | None:
+    """Safety factor of one load entry: ∞ at zero load, None without a capacity or a load."""
+    cap, mx = entry.get("capacity"), entry.get("max_abs")
+    if cap is None or mx is None:
+        return None
+    return math.inf if mx == 0 else cap / mx
+
+
+def _why(report: dict) -> str | None:
+    bad = next((i for i in report["issues"] if i["severity"] in ("FAIL", "WARN")), None)
+    if bad is None:
+        return None
+    code, what = issue_key(bad)
+    return f"{code} {'/'.join(what) if isinstance(what, tuple) else what}".strip()
+
+
+def _target_value(t: dict) -> float | None:
+    if t.get("value") is None and t.get("error") == "unbounded (∞)":
+        return math.inf
+    return t.get("value")
 
 
 def _summarize(params: dict, report: dict) -> Variant:
     sevs = [i["severity"] for i in report["issues"]]
     clear = [s["min_clearance"]["value"] for s in report["studies"]
              if s.get("min_clearance") and s["min_clearance"].get("value") is not None]
-    sfs = [e["sf"] for s in report["studies"] for e in (s.get("loads") or {}).values() if e.get("sf") is not None]
+    sfs = [sf for s in report["studies"] for e in (s.get("loads") or {}).values() if (sf := _sf(e)) is not None]
     return Variant(params, report["status"], sevs.count("FAIL"), sevs.count("WARN"), min(clear, default=None),
-                   min(sfs, default=None), {t["label"]: t["value"] for t in report["targets"]}, None, report)
+                   min(sfs, default=None), {t["label"]: _target_value(t) for t in report["targets"]}, None, report,
+                   _why(report))
 
 
 def run_sweep(build: Callable[..., Assembly], variants: list[dict], *, base: dict | None = None,
-              frames: int | None = None, out_root: Path = Path("output")) -> list[Variant]:
+              frames: int | None = None, out_root: Path | None = None) -> list[Variant]:
     """Build and analyze (no export) every variant; a build() exception becomes an INVALID row.
 
     ``base`` holds the fixed build() keyword values; each variant's values override it.
@@ -113,9 +139,10 @@ def run_sweep(build: Callable[..., Assembly], variants: list[dict], *, base: dic
         try:
             asm = build(**full)
         except Exception as exc:  # user code: one bad variant must not stop the sweep
-            rows.append(Variant(params, "INVALID", 1, error=f"{type(exc).__name__}: {exc}"))
+            error = f"{type(exc).__name__}: {exc}"
+            rows.append(Variant(params, "INVALID", 1, error=error, why=f"build() {error}"))
             continue
-        report = analyze(asm, frames=frames, export=False, out_root=out_root, params=full)
+        report = analyze(asm, frames=frames, export=False, out_root=out_root, params=full, progress=False)
         rows.append(_summarize(params, report))
     if sys.stderr.isatty():
         print("\r" + " " * 24 + "\r", end="", file=sys.stderr, flush=True)
@@ -124,12 +151,14 @@ def run_sweep(build: Callable[..., Assembly], variants: list[dict], *, base: dic
 
 def _rank(v: Variant) -> tuple:
     clearance = v.min_clearance if v.min_clearance is not None else math.inf
-    sf = v.worst_sf if v.worst_sf is not None else math.inf
+    # a missing SF (no rated actuator, or the load undefined) is neutral, never "infinitely safe"
+    sf = v.worst_sf if v.worst_sf is not None else 0.0
     return (_STATUS_RANK.get(v.status, 3), v.fails, v.warns, -clearance, -sf)
 
 
 def best_variant(rows: list[Variant]) -> Variant:
-    """Best status, then fewest FAIL/WARN, then largest min clearance, then largest worst SF."""
+    """Best status, then fewest FAIL/WARN, then largest min clearance, then largest worst SF (a
+    variant without one ranks below any measured SF)."""
     return min(rows, key=_rank)
 
 
@@ -137,7 +166,7 @@ def _cell(v) -> str:
     if v is None:
         return "–"
     if isinstance(v, float):
-        return sig(v)
+        return "∞" if v == math.inf else sig(v)
     return str(v)
 
 
@@ -146,20 +175,18 @@ def format_table(rows: list[Variant]) -> str:
     shown = rows if len(rows) <= MAX_ROWS else sorted(rows, key=_rank)[:MAX_ROWS]
     keys = list(rows[0].params) if rows else []
     labels = list(dict.fromkeys(label for r in rows for label in r.targets))
-    head = keys + ["status", "F/W", "min clr", "worst SF"] + [lbl[:14] for lbl in labels]
+    head = keys + ["status", "F/W", "min clr", "worst SF"] + [lbl[:14] for lbl in labels] + ["why"]
     body = []
     for r in shown:
         cells = [_cell(r.params.get(k)) for k in keys] + [r.status, f"{r.fails}/{r.warns}", _cell(r.min_clearance),
                                                           _cell(r.worst_sf)]
         cells += [_cell(r.targets.get(lbl)) for lbl in labels]
-        if r.error:
-            cells.append(r.error[:60])
+        cells.append((r.why or "")[:60])
         body.append(cells)
-    widths = [max(len(row[i]) for row in [head] + body if i < len(row)) for i in range(len(head))]
-    lines = ["  ".join(c.ljust(w) for c, w in zip(head, widths)).rstrip()]
-    for cells in body:
-        fixed = "  ".join(c.ljust(w) for c, w in zip(cells, widths))
-        lines.append((fixed + ("  " + cells[-1] if len(cells) > len(head) else "")).rstrip())
+    widths = [max(len(row[i]) for row in [head] + body) for i in range(len(head) - 1)]
+    lines = []
+    for cells in [head] + body:  # the last column (why) is free-width
+        lines.append(("  ".join(c.ljust(w) for c, w in zip(cells, widths)) + "  " + cells[-1]).rstrip())
     if len(rows) > len(shown):
         lines.append(f"(+{len(rows) - len(shown)} more variants not shown — the {MAX_ROWS} best are listed)")
     return "\n".join(lines)

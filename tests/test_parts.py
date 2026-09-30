@@ -318,6 +318,14 @@ def test_sg90_heights() -> None:
     assert lo[2] == pytest.approx(-15.9)
 
 
+def test_servo_horn_frame_is_the_spline_tip() -> None:
+    for make, tip in [(sg90, 14.0), (mg996r, 16.4)]:
+        s = make()
+        np.testing.assert_allclose(frame_pos(s.frames["horn"]), (0, 0, tip), atol=1e-9)
+        np.testing.assert_allclose(frame_dir(s.frames["horn"]), (0, 0, 1), atol=1e-12)
+        assert bbox(s)[1][2] == pytest.approx(tip)  # nothing of the servo above the horn seat
+
+
 def test_n20() -> None:
     m = n20_gearmotor()
     lo, hi = bbox(m)
@@ -526,3 +534,13 @@ def test_parts_are_valid_fast_and_described(make) -> None:
         for i, a in enumerate(solids):
             for b in solids[i + 1:]:
                 assert common_volume(a, b) == pytest.approx(0, abs=1e-6)
+
+
+def test_tooth_bearing_parts_are_tagged_and_keep_the_tag_when_moved() -> None:
+    """`kind` marks the parts whose teeth mesh (Assembly.meshing_pairs only excuses those)."""
+    gp = gear_pair(1, 15, 30, 6)
+    assert spur_gear(1, 20, 5).kind == gp.g1.kind == gp.g2.kind == "gear"
+    assert rack(1, 60, 6, 8).kind == "rack" and gt2_pulley(20, 6, 5).kind == "pulley"
+    assert (Pos(3, 0, 0) * Rot(0, 0, 30) * gp.g2).kind == "gear"
+    assert gp.g1.mate("axis", Location((10, 0, 0))).kind == "gear"
+    assert nema17().kind is None and bearing("608").kind is None

@@ -25,7 +25,9 @@ from mech.statics import gravity_loads
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 G = 9.80665
-NAMES = ["four_bar", "slider_crank", "gear_train", "leadscrew_stage", "pendulum_arm", "hinged_box"]
+NAMES = ["four_bar", "slider_crank", "gear_train", "leadscrew_stage", "pendulum_arm", "hinged_box",
+         "parallel_gripper", "scissor_lift"]
+MAX_LINES = {"parallel_gripper": 60, "scissor_lift": 60}  # promoted dogfood designs; the rest ≤ 50
 
 
 def example(name: str) -> ModuleType:
@@ -59,7 +61,7 @@ def wrap180(deg: float) -> float:
 @pytest.mark.parametrize("name", NAMES)
 def test_example_is_a_short_parametric_template(name):
     text = (EXAMPLES / f"{name}.py").read_text(encoding="utf-8")
-    assert len(text.splitlines()) <= 50
+    assert len(text.splitlines()) <= MAX_LINES.get(name, 50)
     assert 'if __name__ == "__main__":\n    run(build())' in text
     asm = example(name).build()  # every tunable has a keyword default
     assert asm.validate() == []
@@ -182,3 +184,51 @@ def test_hinged_box_negative_gap_interferes(tmp_path_factory):
     assert worst["value"] == pytest.approx(1.0 * depth * wall, rel=0.02)  # spec: within 2% of analytic
     np.testing.assert_allclose(worst["extent"], [1.0, depth, wall], atol=1e-6)
     np.testing.assert_allclose(worst["location"], [0.0, 0.0, 30.0 + wall / 2], atol=1e-6)
+
+
+def test_parallel_gripper_jaws_translate_and_open_to_the_gap(tmp_path_factory):
+    """Gear pair ratio −1; each jaw rides a parallelogram, so it never turns (j_jaw = −j_drive); the
+    pads meet when drawn closed and are exactly gap_open apart at the end of the stroke."""
+    asm, kin, res = solved("parallel_gripper")
+    for pose in res.poses:
+        assert pose.ok
+        assert pose.q["j_idler"] == pytest.approx(-pose.q["j_drive"], abs=1e-9)
+        assert pose.q["j_jaw_l"] == pytest.approx(-pose.q["j_drive"], abs=1e-6)
+        assert pose.q["j_fol_l"] == pytest.approx(pose.q["j_drive"], abs=1e-6)
+    gap = np.linalg.norm(np.asarray(res.probes["pad_l"]) - np.asarray(res.probes["pad_r"]), axis=1)
+    assert gap[0] == pytest.approx(0.0, abs=1e-6) and gap[-1] == pytest.approx(30.0, abs=1e-6)
+    report = report_of(tmp_path_factory, "parallel_gripper")
+    assert report["status"] == "PASS" and all(t["met"] for t in report["targets"])
+    tilt = next(t for t in report["targets"] if t["label"] == "jaws parallel")
+    assert tilt["value"] <= 1e-9
+    assert "no gravity load on j_drive (axis ∥ g or balanced)" in format_summary(report)
+    # the opening lands on its bound by construction: float noise must not turn that into a miss
+    for L, open_deg in ((35.0, 110.0), (30.0, 110.0)):
+        variant = report_of(tmp_path_factory, "parallel_gripper", L=L, open_deg=open_deg)
+        opening = next(t for t in variant["targets"] if t["label"] == "opening")
+        assert opening["value"] == pytest.approx(30.0, abs=1e-6) and opening["met"], (L, open_deg)
+        assert variant["status"] == "PASS"
+
+
+def test_scissor_lift_travel_and_holding_load(tmp_path_factory):
+    """Deck height 2·L·sin θ (+ const), slide x = L·cos θ, right-hand T8 screw: −8 mm per +360°.
+    With a payload that dwarfs the linkage, virtual work gives the slide force 2·W·cot θ (max at the
+    drawn θ0) and the screw torque F·lead/(2π)."""
+    L, th0, th1 = 120.0, 10.0, 40.0
+    asm, kin, res = solved("scissor_lift")
+    for pose in res.poses:
+        assert pose.ok and pose.q["j_slide"] == pytest.approx(-8.0 / 360.0 * pose.q["j_leadrot"], abs=1e-9)
+    report = report_of(tmp_path_factory, "scissor_lift")
+    assert report["status"] == "PASS" and all(t["met"] for t in report["targets"])
+    rise = 2 * L * (math.sin(math.radians(th1)) - math.sin(math.radians(th0)))
+    assert np.ptp(np.asarray(res.probes["deck"])[:, 2]) == pytest.approx(rise, abs=1e-6)
+    travel = next(t for t in report["targets"] if t["label"] == "travel")
+    assert travel["value"] == pytest.approx(rise, rel=5e-6)  # report numbers carry 6 significant figures
+    lo, hi = report["studies"][0]["joint_ranges"]["j_slide"]
+    assert hi - lo == pytest.approx(L * (math.cos(math.radians(th0)) - math.cos(math.radians(th1))), rel=5e-6)
+    heavy = report_of(tmp_path_factory, "scissor_lift", payload_g=100_000.0)
+    force = 2 * 100.0 * G / math.tan(math.radians(th0))  # N on the slide at θ0
+    loads = heavy["studies"][0]["loads"]
+    assert loads["j_slide"]["max_abs"] == pytest.approx(force, rel=1e-2) and loads["j_slide"]["frame"] == 0
+    assert loads["j_leadrot"]["max_abs"] == pytest.approx(force * 0.008 / (2 * math.pi), rel=1e-2)
+    assert heavy["status"] == "FAIL" and "over_capacity" in codes(heavy, "FAIL")

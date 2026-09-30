@@ -7,6 +7,11 @@ Layout::
       scene.json              parts, joints, pins, probes, per-study frames (+ the report)
       report.json             the report alone (read back as ``prev`` by the next run)
       assembly.step           optional, all parts at home
+      report.partial.json     the last partial (``--study``/``--frames``) run's report
+
+scene.json/report.json always describe the last *full* run (every study at its declared frame
+count): a partial run writes only ``report.partial.json``, and an INVALID full run writes its
+report.json and removes the scene, STLs and STEP of the model it no longer matches.
 
 File names come from ``geom.slug`` (ASCII, Windows-reserved-safe, de-duplicated) and the viewer
 only uses ``parts[].mesh``, never ids, to find them. JSON files are written atomically with
@@ -35,11 +40,13 @@ if TYPE_CHECKING:
     from .massprops import MassProps
     from .motion import StudyResult
 
-__all__ = ["export_scene", "mech_dir", "read_report", "write_report", "write_json"]
+__all__ = ["export_scene", "mech_dir", "read_report", "write_report", "write_json", "clear_scene", "ExportError",
+           "REPORT", "PARTIAL_REPORT"]
 
 ANGULAR_TOLERANCE = 0.2  # rad, STL tessellation
 _IDENTITY_TOL = 1e-9  # a transform this close to I in every frame is omitted from scene.json
 _SCENE_ISSUE_STATUSES = ("interference", "tight")  # what the viewer draws
+REPORT, PARTIAL_REPORT = "report.json", "report.partial.json"
 
 
 def mech_dir(out_root: Path | str, name: str) -> Path:
@@ -58,9 +65,10 @@ def write_json(path: Path, obj: Any, *, indent: int | None = None) -> None:
     os.replace(tmp, path)
 
 
-def read_report(out_root: Path | str, name: str) -> dict | None:
-    """The previous ``report.json`` of ``name`` (None if missing or unreadable)."""
-    path = mech_dir(out_root, name) / "report.json"
+def read_report(out_root: Path | str, name: str, *, partial: bool = False) -> dict | None:
+    """The previous ``report.json`` of ``name`` (``report.partial.json`` with ``partial``); None if
+    missing or unreadable."""
+    path = mech_dir(out_root, name) / (PARTIAL_REPORT if partial else REPORT)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -68,31 +76,55 @@ def read_report(out_root: Path | str, name: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def write_report(report: dict, out_root: Path | str) -> Path:
-    """Write ``report.json`` only (used for INVALID runs, which have no scene)."""
-    path = mech_dir(out_root, report["name"]) / "report.json"
+def write_report(report: dict, out_root: Path | str, *, partial: bool = False) -> Path:
+    """Write the report alone: ``report.partial.json`` for a partial run, else ``report.json``
+    (an INVALID full run, which has no scene: see ``clear_scene``)."""
+    path = mech_dir(out_root, report["name"]) / (PARTIAL_REPORT if partial else REPORT)
     write_json(path, jsonable(report), indent=1)
     return path
 
 
-def _write_stl(shape, path: Path, tolerance: float) -> None:
+def clear_scene(out_root: Path | str, name: str) -> None:
+    """Remove the scene, part STLs and STEP of ``name`` (after an INVALID full run they would show
+    a model that no longer exists) and the now-stale ``report.partial.json``."""
+    out = mech_dir(out_root, name)
+    for f in ("scene.json", "assembly.step", PARTIAL_REPORT):
+        (out / f).unlink(missing_ok=True)
+    for stl in (out / "parts").glob("*.stl"):
+        stl.unlink()
+
+
+class ExportError(Exception):
+    """A part could not be exported (its STL was not written); the message names the part."""
+
+
+def _write_stl(shape, path: Path, tolerance: float, part: str | None = None) -> None:
     """Binary STL; verifies the file really is 84 + 50·n bytes (export_stl can report success on
-    a path Windows silently mangled)."""
+    a path Windows silently mangled). Any failure raises ``ExportError`` and leaves no
+    ``*.tmp.stl`` behind."""
     tmp = path.with_name(path.stem + ".tmp.stl")
-    if not export_stl(shape, str(tmp), tolerance=tolerance, angular_tolerance=ANGULAR_TOLERANCE, ascii_format=False):
-        raise RuntimeError(f"export_stl failed for {path.name}")
+    what = f"part '{part}'" if part is not None else path.name
     try:
-        size = tmp.stat().st_size
-        with tmp.open("rb") as f:
-            f.seek(80)
-            head = f.read(4)
-    except OSError as exc:
-        raise RuntimeError(f"STL {path.name} was not written ({exc})") from exc
-    n = struct.unpack("<I", head)[0] if len(head) == 4 else -1
-    if n < 0 or size != 84 + 50 * n:
+        try:
+            ok = export_stl(shape, str(tmp), tolerance=tolerance, angular_tolerance=ANGULAR_TOLERANCE,
+                            ascii_format=False)
+        except Exception as exc:  # OCC tessellation / writer failure
+            raise ExportError(f"could not write the STL of {what} ({type(exc).__name__}: {exc})") from None
+        if not ok:
+            raise ExportError(f"could not write the STL of {what} (export_stl failed)")
+        try:
+            size = tmp.stat().st_size
+            with tmp.open("rb") as f:
+                f.seek(80)
+                head = f.read(4)
+        except OSError as exc:
+            raise ExportError(f"the STL of {what} was not written ({exc})") from None
+        n = struct.unpack("<I", head)[0] if len(head) == 4 else -1
+        if n < 0 or size != 84 + 50 * n:
+            raise ExportError(f"the STL of {what} is broken: {size} bytes is not a binary STL of {n} triangles")
+        os.replace(tmp, path)
+    finally:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"STL {path.name}: {size} bytes is not a binary STL of {n} triangles")
-    os.replace(tmp, path)
 
 
 def _bbox(shape) -> list[list[float]]:
@@ -156,9 +188,9 @@ def export_scene(asm: Assembly, kin: Kinematics, props: dict[str, MassProps], re
     taken: set[str] = set()
     meshes = {name: f"parts/{slug(name, taken)}.stl" for name in asm.parts}
     for name, part in asm.parts.items():
-        _write_stl(part.shape, out / meshes[name], tolerance)
+        _write_stl(part.shape, out / meshes[name], tolerance, name)
     wanted = {Path(m).name for m in meshes.values()}
-    for stale in parts_dir.glob("*.stl"):
+    for stale in parts_dir.glob("*.stl"):  # incl. *.tmp.stl left by an interrupted run
         if stale.name not in wanted:
             stale.unlink()
 
@@ -206,5 +238,6 @@ def export_scene(asm: Assembly, kin: Kinematics, props: dict[str, MassProps], re
         "report": report,
     }
     write_json(out / "scene.json", jsonable(scene))
-    write_json(out / "report.json", jsonable(report), indent=1)
+    write_json(out / REPORT, jsonable(report), indent=1)
+    (out / PARTIAL_REPORT).unlink(missing_ok=True)  # older than this full run: Δprev uses report.json
     return out

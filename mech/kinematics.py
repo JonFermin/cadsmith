@@ -10,6 +10,14 @@ act on deltas from home and are linear, so every joint value is an affine functi
 independent (non-coupled) ones: q = h + D·(u − h) + o. Loop closure solves the pin residuals
 for the non-coupled, non-driven loop joints with a trust-region least-squares corrector and an
 analytic Jacobian (screw-theory twists chained through D).
+
+Continuation keeps the solution on one assembly branch: each sub-step starts from a secant
+extrapolation of the previous solutions (falling back to the tangent predictor and a plain warm
+start) and keeps the converged solution closest to that extrapolation, so a frame that lands
+exactly on a change point (where J_p is singular and both branches meet) does not flip branch.
+Generic ranks (mobility, over-driven loops) are taken at random poses *on* the constraint
+manifold — perturbed and re-closed — so special-geometry mobile linkages (a redundant parallel
+link, a spherical 4R) are not mistaken for overconstrained ones.
 """
 
 from __future__ import annotations
@@ -24,16 +32,39 @@ from scipy.optimize import least_squares
 from .assembly import Assembly, Joint, ModelError, _suggest
 from .geom import rot_about_line, transform_points, translation
 
-__all__ = ["Pose", "Kinematics", "RESIDUAL_TOL"]
+__all__ = ["Pose", "Kinematics", "RESIDUAL_TOL", "COND_MAX", "SINGULAR_COND", "driven_block"]
 
 RESIDUAL_TOL = 1e-4  # mm: a pose is ok when every residual row is within this
 RANK_RTOL = 1e-9  # SVD rank tolerance relative to the largest singular value
+COND_MAX = 1e8  # a (scaled) loop Jacobian worse conditioned than this gets no holding load
+# A frame this badly conditioned sits on a change/dead point: a double root there is only solved
+# to ~1e-6°, where cond is ~1e7, so the branch-ambiguity test uses a looser bound than COND_MAX.
+SINGULAR_COND = 1e6
 _SOLVER_TOL = 1e-12  # least_squares xtol = ftol = gtol
 _STEP_DEG = 10.0  # continuation: largest revolute driver step per corrector solve
 _STEP_FRAC = 0.05  # continuation: largest prismatic driver step, as a fraction of L
 _MAX_STEPS = 720
 _PREDICT_RCOND = 1e-6  # pinv cutoff for the tangent predictor (skips near-singular directions)
 _N_PERTURB, _PERTURB_DEG, _PERTURB_FRAC, _SEED = 3, 10.0, 0.05, 0  # generic-rank samples
+_ZERO = 1e-12  # relative magnitude below which a Jacobian entry is structurally zero
+
+
+def driven_block(Jp: np.ndarray, Jd: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(rows, passive columns) of the loop equations the drivers act on, as boolean masks.
+
+    The closure equations decouple into blocks; starting from the rows the drivers touch, add
+    every passive joint in those rows and every row those joints touch, until closed. Loops a
+    study doesn't drive stay at home and don't affect its loads, conditioning or singularities.
+    """
+    scale = max(float(np.max(np.abs(Jp), initial=0.0)), float(np.max(np.abs(Jd), initial=0.0)), 1.0)
+    A, B = np.abs(Jp) > _ZERO * scale, np.abs(Jd) > _ZERO * scale
+    rows = B.any(axis=1)
+    while True:
+        cols = A[rows].any(axis=0)
+        grown = rows | A[:, cols].any(axis=1)
+        if np.array_equal(grown, rows):
+            return rows, cols
+        rows = grown
 
 
 @dataclass
@@ -238,14 +269,18 @@ class Kinematics:
 
     # ------------------------------------------------------------------------ solving
 
-    def solve(self, drive: Mapping[str, float], guess: Mapping[str, float] | None = None) -> Pose:
+    def solve(self, drive: Mapping[str, float], guess: Mapping[str, float] | None = None, *,
+              prev: Mapping[str, float] | None = None, step_scale: float = 1.0) -> Pose:
         """Pose with ``drive`` prescribed and every loop closed; never raises (failure -> ok=False).
 
         Starts from ``guess`` (e.g. the previous frame's ``pose.q``; default home) and walks the
-        drivers to their targets in steps of ≤ 10° / ≤ 0.05·L, each step a tangent predictor
-        followed by a least-squares corrector, so the solution stays on the branch of the start
-        pose. Entries of ``drive`` naming unknown, fixed or coupled joints are ignored
-        (``motion.check_study`` rejects those). Revolute unknowns end within guess ± 180°.
+        drivers to their targets in steps of ≤ 10° / ≤ 0.05·L (times ``step_scale``), each step
+        a predictor followed by a least-squares corrector, so the solution stays on the branch of
+        the start pose. ``prev`` — the pose before ``guess`` (e.g. frame k−2) — seeds the secant
+        predictor that carries the branch through singular poses. Entries of ``drive`` naming
+        unknown, fixed or coupled joints are ignored (``motion.check_study`` rejects those).
+        Revolute unknowns are unwrapped step by step (each within ±180° of the previous step), so
+        a passive joint that turns further than 180° in one call keeps its true value.
         """
         ref = self._home.copy()
         drv: dict[str, float] = {}
@@ -253,6 +288,12 @@ class Kinematics:
             for name, v in (guess or {}).items():
                 if name in self._idx and math.isfinite(float(v)):
                     ref[self._idx[name]] = float(v)
+            before = None
+            if prev is not None:
+                before = self._home.copy()
+                for name, v in prev.items():
+                    if name in self._idx and math.isfinite(float(v)):
+                        before[self._idx[name]] = float(v)
             drv = {n: float(v) for n, v in drive.items() if n in self._idx and n not in self.coupled}
             unknown = self.unknowns(drv)
             didx = np.array([self._idx[n] for n in drv], dtype=int)
@@ -264,50 +305,99 @@ class Kinematics:
                 u = ref.copy()
                 u[didx] = target
             else:
-                u = self._track(ref, uidx, didx, target)
+                u = self._track(ref, uidx, didx, target, before, float(step_scale))
             return self._pose(u, unknown)
         except (TypeError, ValueError, np.linalg.LinAlgError):
             # malformed input or a numerical breakdown: report an open pose instead of raising
             return self._pose(ref, self.unknowns(drv), residual=math.inf)
 
-    def _track(self, ref: np.ndarray, uidx: np.ndarray, didx: np.ndarray, target: np.ndarray) -> np.ndarray:
-        """Continuation from ``ref`` to the driver ``target`` values; returns the full u vector."""
+    def _track(self, ref: np.ndarray, uidx: np.ndarray, didx: np.ndarray, target: np.ndarray,
+               before: np.ndarray | None = None, step_scale: float = 1.0) -> np.ndarray:
+        """Continuation from ``ref`` to the driver ``target`` values; returns the full u vector.
+
+        ``before`` (the solution preceding ``ref``, if any) and every sub-step's solution feed the
+        secant predictor of the next sub-step.
+        """
         start = ref[didx]
         n_steps = 1
         if didx.size:
-            max_step = np.where(self._rev[didx], _STEP_DEG, _STEP_FRAC * self.L)
+            max_step = np.where(self._rev[didx], _STEP_DEG, _STEP_FRAC * self.L) * max(step_scale, 1e-3)
             n_steps = int(min(_MAX_STEPS, max(1, math.ceil(float(np.max(np.abs(target - start) / max_step))))))
+        wrap = [i for i in uidx if self._rev[i] and self._names[i] not in self._coupling_drivers]
+        history = ([before] if before is not None else []) + [ref]
         u = ref.copy()
         for k in range(1, n_steps + 1):
-            u = self._step(u, uidx, didx, start + (target - start) * (k / n_steps))
-        for i in uidx:
-            # a full turn of a revolute is the same pose — unless it drives a coupling
-            if self._rev[i] and self._names[i] not in self._coupling_drivers:
-                u[i] = ref[i] + (u[i] - ref[i] + 180.0) % 360.0 - 180.0
+            d_next = start + (target - start) * (k / n_steps)
+            u_new = self._step(u, uidx, didx, d_next, self._secant(history, uidx, didx, d_next))
+            for i in wrap:
+                # a full turn of a revolute is the same pose (unless it drives a coupling): keep
+                # each sub-step within ±180° of the last, which unwraps fast passive joints
+                u_new[i] = u[i] + (u_new[i] - u[i] + 180.0) % 360.0 - 180.0
+            history = [history[-1], u_new]
+            u = u_new
         return u
 
-    def _step(self, u: np.ndarray, uidx: np.ndarray, didx: np.ndarray, d_next: np.ndarray) -> np.ndarray:
-        """Move the drivers to ``d_next`` and re-close the loops (predictor, then plain warm start)."""
+    def _secant(self, history: list[np.ndarray], uidx: np.ndarray, didx: np.ndarray,
+                d_next: np.ndarray) -> np.ndarray | None:
+        """Linear extrapolation of the unknowns from the last two solutions to drivers ``d_next``
+        (None without two solutions that differ in their drivers)."""
+        if len(history) < 2 or not didx.size:
+            return None
+        u0, u1 = history[-2], history[-1]
+        scale = self._col_scale[didx]
+        dd_prev = (u1[didx] - u0[didx]) * scale
+        dd = (d_next - u1[didx]) * scale
+        denom = float(dd_prev @ dd_prev)
+        if denom <= 1e-24 * max(1.0, float(dd @ dd)):
+            return None
+        r = float(dd @ dd_prev) / denom
+        hint = u1.copy()
+        hint[didx] = d_next
+        hint[uidx] = u1[uidx] + r * (u1[uidx] - u0[uidx])
+        return hint
+
+    def _step(self, u: np.ndarray, uidx: np.ndarray, didx: np.ndarray, d_next: np.ndarray,
+              hint: np.ndarray | None = None) -> np.ndarray:
+        """Move the drivers to ``d_next`` and re-close the loops.
+
+        Starts: the secant ``hint`` (when given), the tangent predictor, a plain warm start. Without
+        a hint the first converged solution wins; with one, a converged solution within half the
+        hinted step of the hint is taken at once, else the converged solution closest to the hint
+        (the branch the previous steps were on — at a change point both branches converge).
+        """
         plain = u.copy()
         plain[didx] = d_next
         starts = [plain]
         delta = d_next - u[didx]
+        scale = self._col_scale[uidx]
         if np.any(delta != 0):
             J = self._jac(self._q(u))
-            scale = self._col_scale[uidx]
             dy = -np.linalg.pinv(J[:, uidx] / scale, rcond=_PREDICT_RCOND) @ (J[:, didx] @ delta)
             if np.max(np.abs(dy), initial=0.0) <= self.L:  # ignore wild steps near singularities
                 predicted = plain.copy()
                 predicted[uidx] += dy / scale
                 starts.insert(0, predicted)
+        if hint is not None:
+            starts.insert(0, hint)
+            accept = 0.5 * float(np.linalg.norm((hint[uidx] - u[uidx]) * scale)) + 1e-9 * self.L
+            turns = self._rev[uidx] & np.array([self._names[i] not in self._coupling_drivers for i in uidx])
         best: tuple[np.ndarray, float] | None = None
+        closest: tuple[np.ndarray, float] | None = None
         for u0 in starts:
             u1, res = self._correct(u0, uidx)
             if res <= RESIDUAL_TOL:
-                return u1
+                if hint is None:
+                    return u1
+                diff = u1[uidx] - hint[uidx]
+                diff = np.where(turns, (diff + 180.0) % 360.0 - 180.0, diff)  # a full turn is no offset
+                off = float(np.linalg.norm(diff * scale))
+                if off <= accept:
+                    return u1
+                if closest is None or off < closest[1]:
+                    closest = (u1, off)
             if best is None or res < best[1]:
                 best = (u1, res)
-        return best[0]
+        return closest[0] if closest is not None else best[0]
 
     def _correct(self, u0: np.ndarray, uidx: np.ndarray) -> tuple[np.ndarray, float]:
         """Least-squares closure over the unknowns (revolutes in radians); returns (u, max |r|)."""
@@ -356,11 +446,31 @@ class Kinematics:
         return int(np.count_nonzero(sv > RANK_RTOL * sv[0])) if sv[0] > 1e-12 else 0
 
     def _samples(self) -> list[np.ndarray]:
-        """Jacobians at home and at 3 seeded random perturbations of it (for generic ranks)."""
+        """Jacobians at home and at 3 seeded random poses near it (for generic ranks).
+
+        The random poses lie on the constraint manifold: every joint is perturbed, then the loop
+        joints are re-closed by least squares. A perturbation that leaves the loops open would
+        break a special geometry (parallel links, intersecting axes) and show constraints that
+        are redundant on every real pose. When home itself doesn't close (a model whose loops
+        can't assemble) or no perturbation re-closes, the raw perturbations are used.
+        """
         if self._sample_jacs is None:
             rng = np.random.default_rng(_SEED)
             amp = np.where(self._rev, _PERTURB_DEG, _PERTURB_FRAC * self.L)
-            us = [self._home] + [self._home + amp * rng.uniform(-1.0, 1.0, amp.size) for _ in range(_N_PERTURB)]
+            raw = [self._home + amp * rng.uniform(-1.0, 1.0, amp.size) for _ in range(_N_PERTURB)]
+            loop = np.array([self._idx[n] for n in self._names if n in self._loop_joints and n not in self.coupled],
+                            dtype=int)
+            closed = []
+            home_closed = float(np.max(np.abs(self._residual(self._q(self._home))), initial=0.0)) <= RESIDUAL_TOL
+            if loop.size and home_closed:
+                for u in raw:
+                    try:
+                        u1, res = self._correct(u, loop)
+                    except (ValueError, np.linalg.LinAlgError):
+                        continue
+                    if res <= RESIDUAL_TOL:
+                        closed.append(u1)
+            us = [self._home] + (closed or raw)
             self._sample_jacs = [self._jac(self._q(u)) for u in us]
         return self._sample_jacs
 
@@ -395,6 +505,26 @@ class Kinematics:
             root[find(c.driven)] = find(c.driver)
         acted = {find(n) for n in driven}
         return [n for n in self.unknowns(driven) if find(n) not in acted]
+
+    def singular(self, pose: Pose, driven: Iterable[str]) -> bool:
+        """Does the pose sit on a singularity of the loops ``driven`` acts on — a change point or
+        dead point where J_p loses its generic rank (cond > 1e6), so the assembly branch beyond it
+        is ambiguous? False for open poses and for loops left with free DOF (underconstrained)."""
+        driven = list(driven)
+        if not pose.ok:
+            return False
+        Jp, Jd = self.jacobians(pose, driven)
+        if Jp.shape[1] == 0:
+            return False
+        rows, cols = driven_block(Jp, Jd)
+        if not cols.any():
+            return False
+        unknown = self.unknowns(driven)
+        idx = [self._idx[unknown[i]] for i in np.flatnonzero(cols)]
+        if len(idx) - max(self._rank(J[rows], idx) for J in self._samples()) > 0:
+            return False  # underconstrained block: its rank deficiency is mobility, not a singularity
+        sv = np.linalg.svd(Jp[np.ix_(rows, cols)] / self._col_scale[idx], compute_uv=False)
+        return bool(sv.size < len(idx) or sv[-1] <= 0 or sv[0] / sv[-1] > SINGULAR_COND)
 
     def singular_at_home(self, driven: Iterable[str]) -> bool:
         """True when J_p loses rank at the home pose although its generic rank is higher."""

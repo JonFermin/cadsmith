@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from build123d import Box, Cylinder, Pos, Sphere
+from build123d import Box, Cylinder, Pos, Sphere, Vector
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.Extrema import Extrema_ExtFlag_MIN
 
@@ -22,7 +23,8 @@ from mech.parts import gear_pair
 FAR = Pos(0, 0, -500) * Box(4, 4, 4)  # a ground part well away from everything under test
 
 
-def two_parts(shape_a, shape_b, *, clearance=0.3, joined=False, allowed=False, ignored=False) -> Assembly:
+def two_parts(shape_a, shape_b, *, clearance=0.3, joined=False, allowed=False, ignored=False,
+              max_depth=0.1) -> Assembly:
     """Parts 'a' and 'b' on slides from a distant base (not joined) or b hinged on a (joined)."""
     asm = Assembly("pair", clearance=clearance)
     asm.part("base", FAR, ground=True)
@@ -34,7 +36,7 @@ def two_parts(shape_a, shape_b, *, clearance=0.3, joined=False, allowed=False, i
     else:
         asm.prismatic("j_b", "base", "b", origin=(0, 0, 0), axis=(1, 0, 0))
     if allowed:
-        asm.allow_contact("a", "b")
+        asm.allow_contact("a", "b", max_depth=max_depth)
     if ignored:
         asm.ignore("a", "b")
     return asm
@@ -124,10 +126,12 @@ def test_overlap_tolerances_and_pair_semantics():
     assert r.volume == pytest.approx(0.3, rel=1e-6)
     assert 2 * r.volume / (2 * 1 + 4 * 0.3) > 0.02 and r.status == "interference"  # ... but 0.19 mm deep
 
-    big = cube10_at_gap(-1.0)  # 100 mm³
-    for kw, status in (({}, "interference"), ({"joined": True}, "interference"), ({"allowed": True}, "contact")):
+    big = cube10_at_gap(-1.0)  # 100 mm³, mean depth 2V/A = 200 / 240 = 0.833 mm
+    for kw, status in (({}, "interference"), ({"joined": True}, "interference"),
+                       ({"allowed": True, "max_depth": 1.0}, "contact")):
         r = pair_result(ClearanceChecker(two_parts(CUBE10, big, **kw)).check_pose({}))
         assert r.status == status and r.volume == pytest.approx(100.0, rel=1e-9)
+        assert r.depth == pytest.approx(200 / 240, rel=1e-9)
         assert (r.joined, r.allowed) == (kw.get("joined", False), kw.get("allowed", False))
     assert pair_result(ClearanceChecker(two_parts(CUBE10, big, ignored=True)).check_pose({})) is None
 
@@ -183,7 +187,8 @@ def test_open_frames_are_not_checked():
     result = SimpleNamespace(poses=[Pose({}, overlapping, 1.0, False), Pose({}, overlapping, 0.0, True)])
     sweep = ClearanceChecker(asm).sweep(result)
     assert sweep.per_frame[0] == [] and sweep.per_frame[1][0].status == "interference"
-    assert sweep.stats["frames_skipped"] == 1 and sweep.min_clearance == ("a", "b", 0.0, 1)
+    # signed: −(mean depth 2V/A) of the 3×10×10 overlap = −600/320 mm
+    assert sweep.stats["frames_skipped"] == 1 and sweep.min_clearance == ("a", "b", pytest.approx(-1.875), 1)
 
 
 # ------------------------------------------------------------------------------ cache & sweeps
@@ -253,6 +258,7 @@ def test_sweep_over_revolute_study():
     assert (tight.a, tight.b, tight.status) == ("wall", "arm", "tight")
     assert tight.distance == pytest.approx(arm_gap(50.0), abs=1e-7) and 0 < arm_gap(50.0) < 0.5
     rect = np.array([[0.0, -2.0], [50.0, -2.0], [50.0, 2.0], [0.0, 2.0]])
+    depths = {}
     for k in (11, 12):
         R = rot_about_line((0, 0, 0), (0, 0, 1), 5.0 * k)[:2, :2]
         overlap = _clip_above(rect @ R.T, 40.0)
@@ -262,8 +268,14 @@ def test_sweep_over_revolute_study():
         lo, hi = overlap.min(axis=0), overlap.max(axis=0)
         np.testing.assert_allclose(r.extent, [*(hi - lo), 4.0], atol=1e-6)
         np.testing.assert_allclose(r.location, [*((lo + hi) / 2), 2.0], atol=1e-6)  # wall = a: home = world
+        # the arm's home frame: the same point turned back by the arm's rotation
+        np.testing.assert_allclose(r.location_b, [*(R.T @ ((lo + hi) / 2)), 2.0], atol=1e-6)
+        perimeter = float(np.sum(np.linalg.norm(np.roll(overlap, -1, axis=0) - overlap, axis=1)))
+        depths[k] = 2 * 4.0 * _area(overlap) / (2 * _area(overlap) + 4.0 * perimeter)  # 2V/A of the prism
+        assert r.depth == pytest.approx(depths[k], rel=1e-6)
     assert sweep.worst[frozenset(("wall", "arm"))][0] == 12  # the larger overlap
-    assert sweep.min_clearance == ("wall", "arm", 0.0, 11)
+    # signed minimum clearance: the deepest overlap, negative
+    assert sweep.min_clearance == ("wall", "arm", pytest.approx(-depths[12], rel=1e-6), 12)
     assert sweep.stats["pairs_checked"] > 0 and sweep.stats["seconds"] > 0 and sweep.stats["frames"] == 13
 
 
@@ -310,3 +322,121 @@ def test_nested_parts_min_clearance_matches_brute_force():
     assert d > 1.0 and all(f == [] for f in sweep.per_frame)
     assert sweep.min_clearance[:2] == (a, b) and sweep.min_clearance[3] == k
     assert sweep.min_clearance[2] == pytest.approx(d, abs=1e-9)
+
+
+# ------------------------------------------------------------------------------ review regressions
+
+
+def test_near_miss_against_another_ground_part_is_tight():
+    """A blade hinged to the ground base swings 0.05 mm past a separate ground post (review
+    p2_ground_joined): the post is not what the hinge connects, so the gap is checked."""
+    asm = Assembly("groundjoined", clearance=0.3)
+    asm.part("base", Pos(0, 0, -10) * Box(120, 120, 4), ground=True)
+    asm.part("post", Pos(40, 2.05, -0.95) * Box(2, 2, 13.9), ground=True)
+    asm.part("blade", Pos(25, 0, 2.5) * Box(50, 2, 5))
+    asm.revolute("j", "base", "blade", origin=(0, 0, 0), axis=(0, 0, 1), limits=(-30, 0))
+    sweep = ClearanceChecker(asm).sweep(run_study(asm, Kinematics(asm), Study("s", {"j": (-30, 0)}, frames=31)))
+    k, r = sweep.worst[frozenset(("post", "blade"))]
+    assert (r.status, k) == ("tight", 30) and r.distance == pytest.approx(0.05, abs=1e-9)
+    assert sweep.min_clearance[:2] == ("post", "blade") and sweep.min_clearance[2] == pytest.approx(0.05, abs=1e-9)
+    # the pair the hinge names stays exempt unless the model asks for it
+    assert frozenset(("base", "blade")) not in sweep.worst
+    asm.check_clearance("base", "blade")
+    (pair,) = [p for p in ClearanceChecker(asm)._pairs if {p.a, p.b} == {"base", "blade"}]
+    assert not pair.joined and not pair.excused
+
+
+def test_list_of_shapes_part_is_fused_for_interference():
+    """Overlapping list members (review p4_compound / min_overlap_list): volumes count the union,
+    and a cube buried in the second member only is still found."""
+    jaw = [Box(10, 10, 10), Pos(8, 0, 0) * Box(10, 10, 10)]  # x ∈ [−5, 13], members overlap on [3, 5]
+    r = pair_result(ClearanceChecker(two_parts(jaw, Pos(16, 0, 0) * Box(10, 10, 10))).check_pose({}))
+    assert r.status == "interference" and r.volume == pytest.approx(2 * 10 * 10, rel=1e-9)  # x ∈ [11, 13]
+    r = pair_result(ClearanceChecker(two_parts(jaw, Pos(10, 0, 0) * Box(2, 2, 2))).check_pose({}))
+    assert r.status == "interference" and r.volume == pytest.approx(8.0, rel=1e-9)
+
+
+def test_containment_in_a_multi_solid_library_part():
+    """OCC's classifier on the 608's three-solid compound calls its outer ring 'outside'; the
+    checker classifies per solid, so a cube buried in the ring interferes (review p5d)."""
+    from mech.parts import bearing
+
+    ring = bearing("608").shape
+    assert not ring.is_inside(Vector(10.0, 0, 0))  # the compound-level classifier's blind spot
+    r = pair_result(ClearanceChecker(two_parts(ring, Pos(10, 0, 0) * Box(0.5, 0.5, 0.5))).check_pose({}))
+    assert r.status == "interference" and r.volume == pytest.approx(0.125, rel=1e-6)
+
+
+def test_allowed_contact_is_bounded_by_max_depth():
+    """An allow_contact pair may overlap only as deep as its max_depth (review p13 / gripper)."""
+    fit = cube10_at_gap(-0.05)  # 5 mm³, mean depth 10/202 = 0.0495 mm: a snug fit
+    deep = cube10_at_gap(-2.0)  # 200 mm³, mean depth 400/280 = 1.43 mm: a jaw driven through the other
+    r = pair_result(ClearanceChecker(two_parts(CUBE10, fit, allowed=True)).check_pose({}))
+    assert r.status == "contact" and r.depth == pytest.approx(10 / 202, rel=1e-6)
+    r = pair_result(ClearanceChecker(two_parts(CUBE10, deep, allowed=True)).check_pose({}))
+    assert r.status == "interference" and r.depth == pytest.approx(400 / 280, rel=1e-6)
+    assert r.volume == pytest.approx(200.0, rel=1e-9) and r.allowed
+    # max_depth=None: any overlap is contact, and no boolean is run for the pair
+    checker = ClearanceChecker(two_parts(CUBE10, deep, allowed=True, max_depth=None))
+    stats = Counter()
+    results, _, _ = checker._check({}, checker._pairs, math.inf, stats)
+    r = pair_result(results)
+    assert r.status == "contact" and r.depth is None and stats["booleans"] == 0
+    # a bounded pair in contact is settled by the boolean alone (no exact distance query)
+    checker = ClearanceChecker(two_parts(CUBE10, fit, allowed=True))
+    stats = Counter()
+    checker._check({}, checker._pairs, math.inf, stats)
+    assert stats["booleans"] == 1 and stats["exact_after_boolean"] == 0
+
+
+def test_min_clearance_is_negative_when_any_pair_interferes():
+    """A joined pair driven into its parent: the study's clearance can't read as the big gap of the
+    unjoined pairs (review dogfood_pantilt zt=65)."""
+    asm = Assembly("sink", clearance=0.3)
+    asm.part("base", FAR, ground=True)
+    asm.part("plate", Pos(0, 0, -2) * Box(60, 60, 4))  # z ∈ [−4, 0]
+    asm.part("arm", Pos(25, 0, 2) * Box(50, 4, 4))  # z ∈ [0, 4], hinged on the plate about +Y
+    asm.part("far", Pos(0, 80, 2) * Box(4, 4, 4))
+    asm.prismatic("j_plate", "base", "plate", origin=(0, 0, 0), axis=(1, 0, 0))
+    asm.prismatic("j_far", "base", "far", origin=(0, 80, 0), axis=(1, 0, 0))
+    asm.revolute("j_arm", "plate", "arm", origin=(0, 0, 2), axis=(0, -1, 0))
+    res = run_study(asm, Kinematics(asm), Study("dip", {"j_arm": (0, -10)}, frames=3))  # tip sinks into the plate
+    sweep = ClearanceChecker(asm).sweep(res)
+    k, r = sweep.worst[frozenset(("plate", "arm"))]
+    assert r.status == "interference" and r.joined and k == 2
+    a, b, value, frame = sweep.min_clearance
+    assert (a, b, frame) == ("plate", "arm", 2) and value == pytest.approx(-r.depth) and value < 0
+
+
+def test_collision_between_frames_is_found():
+    """A thin blade passes a post between two sampled frames (review p1_tunnel): both frames are
+    clear, the sub-frame check finds the hit and reports it at the nearest frame."""
+    asm = Assembly("tunnel", clearance=0.3)
+    asm.part("base", FAR, ground=True)
+    phi = math.radians(3.75)  # halfway between the 0° and 7.5° frames
+    asm.part("post", Pos(40 * math.cos(phi), 40 * math.sin(phi), 2.5) * Box(2, 2, 10), ground=True)
+    asm.part("blade", Pos(25, 0, 2.5) * Box(50, 2, 5))
+    asm.revolute("j", "base", "blade", origin=(0, 0, 0), axis=(0, 0, 1))
+    res = run_study(asm, Kinematics(asm), Study("swing", {"j": (0, 90)}, frames=13))
+    checker = ClearanceChecker(asm)
+    for k in (0, 1):  # neither sampled frame touches the post
+        assert pair_result(checker.check_pose(res.poses[k].transforms), "post", "blade").status == "ok"
+    sweep = checker.sweep(res)
+    k, r = sweep.worst[frozenset(("post", "blade"))]
+    assert r.status == "interference" and r.at == pytest.approx(0.5) and k in (0, 1)
+    assert sweep.min_clearance[:2] == ("post", "blade") and sweep.min_clearance[2] < 0
+    assert sweep.stats["sub_poses"] >= 1
+
+
+def test_spinning_disc_over_a_plate_needs_no_sub_frames():
+    """Rotation never moves points along its own axis: a disc spinning fast 0.5 mm over a plate is
+    settled without intermediate poses, however coarse the frames."""
+    asm = Assembly("spin", clearance=0.3)
+    asm.part("base", FAR, ground=True)
+    asm.part("plate", Pos(0, 0, -2) * (Box(80, 80, 4) - Cylinder(8, 10)), ground=True)  # clear of the axis
+    asm.part("disc", Pos(10, 0, 2) * Box(40, 6, 3))  # an arm spinning 0.5 mm above the plate
+    asm.revolute("j", "base", "disc", origin=(0, 0, 0), axis=(0, 0, 1))
+    assert not asm.is_joined("plate", "disc")
+    sweep = ClearanceChecker(asm).sweep(run_study(asm, Kinematics(asm), Study("spin", {"j": (0, 360)}, frames=6)))
+    assert sweep.stats.get("sub_poses", 0) == 0 and sweep.worst == {}
+    assert sweep.min_clearance[2] == pytest.approx(0.5, abs=1e-9)

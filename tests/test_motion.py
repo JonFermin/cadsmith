@@ -211,6 +211,19 @@ def test_check_study_rejects_coupled_fixed_and_overconstrained(four_bar):
     assert msg.startswith("study 's': overconstrained drivers: j_crank, j_rocker") and "'p_B'" in msg
 
 
+def test_check_study_rejects_a_drive_that_samples_one_pose(four_bar):
+    """2 frames over 0…360° (or 3 over 0…720°) land on one pose: nothing of the motion is analyzed."""
+    kin = Kinematics(four_bar)
+    assert check_study(kin, Study("turn", {"j_crank": (0, 360)}, frames=2)) == [
+        "study 'turn': 2 frames over 0…360° (0° ≡ 360°) sample one pose — use frames ≥ 3"]
+    (msg,) = check_study(kin, Study("turn", {"j_crank": (0, 720)}, frames=3))
+    assert "3 frames over 0…720°" in msg and "frames ≥ 4" in msg
+    assert check_study(kin, Study("turn", {"j_crank": (0, 360)}, frames=3)) == []
+    assert check_study(kin, Study("hold", {"j_crank": 30.0}, frames=2)) == []  # holding a pose is fine
+    # a whole screw turn moves the nut: two poses
+    assert check_study(Kinematics(_leadscrew()), Study("s", {"j_rot": (0, 360)}, frames=2)) == []
+
+
 # ------------------------------------------------------------------------------ run_study
 
 
@@ -279,3 +292,48 @@ def test_branch_jump_detected(four_bar):
         assert size == pytest.approx(abs(crossed.q[j] - open5.q[j])) and size > 20.0
     # the same frames in branch-consistent order are fine
     assert _branch_jumps(kin, ["j_crank"], [open5, kin.solve({"j_crank": 10.0}, open5.q)]) == []
+
+
+# ------------------------------------------------------------------------------ review regressions
+
+
+def test_default_screw_study_respects_the_coupled_slide_limits():
+    """A lead screw without limits driving a nut slide with limits (review lift_nostudy): the default
+    study turns the screw exactly over the slide's range, in the slide's lo → hi direction."""
+    asm = _leadscrew()  # right hand, co-directional axes: −8 mm per +360°, j_nut limits (−50, 50)
+    kin = Kinematics(asm)
+    (study,) = default_studies(asm, kin)
+    assert study.name == "sweep_j_rot"
+    lo, hi = study.drive["j_rot"]
+    assert (lo, hi) == (pytest.approx(2250.0), pytest.approx(-2250.0))  # j_nut −50 → +50
+    res = run_study(asm, kin, study)
+    nut = [p.q["j_nut"] for p in res.poses]
+    assert nut[0] == pytest.approx(-50.0) and nut[-1] == pytest.approx(50.0)
+    assert all(p.limit_violations == [] for p in res.poses)
+    # the driver's own limits still apply, intersected with the coupled range
+    asm.joints["j_rot"].limits = (-720.0, 3600.0)
+    (study,) = default_studies(asm, Kinematics(asm))
+    assert study.drive["j_rot"] == (pytest.approx(-720.0), pytest.approx(2250.0))
+
+
+def test_singular_frames_are_listed_and_branch_jumps_use_the_secant():
+    """A parallelogram driven through its change point: the frame on it is singular, the frames after
+    it stay on the parallelogram, and a hand-made flip right after it is still a branch jump."""
+    from test_kinematics import planar_four_bar
+
+    asm = planar_four_bar(100, 40, 100, 40, th0=60.0, absolute=True)
+    kin = Kinematics(asm)
+    res = run_study(asm, kin, Study("turn", {"j_crank": (60, 240)}, frames=13))  # 15° steps: f8 = 180°
+    assert res.singular == [8] and res.branch_jumps == []
+    # anti-parallelogram at 195° (the crossed branch through the same change point)
+    A = (40 * math.cos(math.radians(195)), 40 * math.sin(math.radians(195)), 0.0)
+    B = next(b for b in (circle_intersect(A, 100, (100, 0, 0), 40, side=s) for s in (1, -1))
+             if abs(math.degrees(math.atan2(b[1], b[0] - 100)) % 360 - 195) > 1)
+    rocker = math.degrees(math.atan2(B[1], B[0] - 100)) % 360
+    coupler = math.degrees(math.atan2(B[1] - A[1], B[0] - A[0])) - 195 + 60
+    flipped = kin.solve({"j_crank": 195.0}, {"j_crank": 195.0, "j_coupler": coupler, "j_rocker": rocker})
+    assert flipped.ok and flipped.q["j_rocker"] == pytest.approx(rocker, abs=1e-6) and rocker < 180.0
+    poses = res.poses[:9] + [flipped]
+    jumps = _branch_jumps(kin, ["j_crank"], poses, {8})
+    assert (9, "j_rocker") in [(k, j) for k, j, _ in jumps]  # a 30° miss of the secant, though it moved < 20°
+    assert _branch_jumps(kin, ["j_crank"], res.poses[:10], {8}) == []

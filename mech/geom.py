@@ -14,7 +14,9 @@ import unicodedata
 
 import numpy as np
 from build123d import Circle, Location, Part, Pos, SlotCenterToCenter, Vector, Vertex, extrude
-from OCP.gp import gp_Trsf
+from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+from OCP.gp import gp_Pnt, gp_Trsf
+from OCP.TopAbs import TopAbs_IN
 
 __all__ = [
     "vec3",
@@ -25,6 +27,7 @@ __all__ = [
     "translation",
     "transform_points",
     "transform_aabb",
+    "inside",
     "to_json16",
     "fnum",
     "slug",
@@ -144,6 +147,22 @@ def transform_aabb(bmin, bmax, T) -> tuple[np.ndarray, np.ndarray]:
     c = M[:3, :3] @ ((lo + hi) / 2) + M[:3, 3]
     e = np.abs(M[:3, :3]) @ ((hi - lo) / 2)
     return c - e, c + e
+
+
+def inside(shape, p, tolerance: float = 1e-6) -> bool:
+    """Is the point ``p`` inside (or on the boundary of) any solid of ``shape``?
+
+    Each solid is classified on its own: OCC's classifier run on a multi-solid compound (a
+    list-of-shapes part, a library motor or bearing) calls many interior points outside.
+    Shapes without solids (faces, shells, wires) contain nothing.
+    """
+    pnt = gp_Pnt(*(float(x) for x in vec3(p)))
+    for solid in shape.solids() if hasattr(shape, "solids") else []:
+        classifier = BRepClass3d_SolidClassifier(solid.wrapped)
+        classifier.Perform(pnt, tolerance)
+        if classifier.State() == TopAbs_IN or classifier.IsOnAFace():
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------------------------

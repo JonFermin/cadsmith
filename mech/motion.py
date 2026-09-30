@@ -3,15 +3,17 @@
 A study prescribes driver joints as functions of a normalized parameter u ∈ [0, 1] and samples
 it per §1: ``once`` gives u_k = k/(N−1) at t_k = duration·k/(N−1); ``pingpong`` gives
 u_k = 1 − |1 − 2k/N| at t_k = duration·k/N (k = 0..N−1), so the last frame wraps seamlessly to
-the first. ``run_study`` solves every frame with the previous frame's pose as the warm start, so
-the passive loop joints stay on the assembly branch they start on.
+the first. ``run_study`` solves every frame with the previous frame's pose as the warm start and
+the two before it as a secant predictor, so the passive loop joints stay on the assembly branch
+they start on — also through a frame that lands exactly on a change point (``singular`` lists
+such frames: there the real mechanism may take either branch).
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -34,6 +36,8 @@ _FRAMES_JOINT = 40  # default study of a single non-loop joint (§2.2)
 _FRAMES_LOOP = 60  # default study of a loop group (§2.2)
 _FULL_TURN = (0.0, 360.0)  # default sweep of a revolute joint without limits
 _LIMIT_TOL = 1e-9  # joint-limit slack for driver values (deg | mm)
+_VERIFY_STEP = 0.2  # branch-jump check: re-trace a suspicious frame step in 2° / 0.01·L sub-steps
+_SAME_BRANCH = 1e-3  # deg | mm: a frame the fine re-trace reproduces this closely is continuous
 
 
 @dataclass
@@ -44,6 +48,7 @@ class StudyResult:
     poses: list[Pose]
     probes: dict[str, np.ndarray]  # probe -> (frames, 3) current world, mm
     branch_jumps: list[tuple[int, str, float]]  # (frame, passive joint, |change| deg | mm)
+    singular: list[int] = field(default_factory=list)  # frames on a change/dead point (J_p singular)
 
 
 # ------------------------------------------------------------------------------ sampling
@@ -124,11 +129,36 @@ def sample_drive(study: Study) -> tuple[np.ndarray, dict[str, np.ndarray]]:
 # ------------------------------------------------------------------------------ default studies
 
 
-def _sweep_range(joint: Joint) -> tuple[float, float] | None:
-    """Default sweep: the limits, or a full turn for a revolute without limits (None: can't sweep)."""
-    if joint.limits is not None:
-        return (float(joint.limits[0]), float(joint.limits[1]))
-    return _FULL_TURN if joint.kind == "revolute" else None
+def _sweep_range(joint: Joint, kin: Kinematics | None = None) -> tuple[float, float] | None:
+    """Default sweep of ``joint`` (None: can't sweep).
+
+    Its own limits, narrowed to where every joint it drives through couplings stays within
+    *its* limits (a lead screw sweeps exactly the turns its nut's slide allows, in the slide's
+    lo → hi direction); without any limits a revolute gets a full turn, a prismatic nothing.
+    When the limits admit no common range, the joint's own range is swept regardless.
+    """
+    lo, hi = (-math.inf, math.inf) if joint.limits is None else (float(joint.limits[0]), float(joint.limits[1]))
+    first: tuple[float, float] | None = None  # the first coupled joint's lo -> hi, mapped back
+    if kin is not None:
+        asm = kin.asm
+        base = kin.expand({})
+        step = kin.expand({joint.name: base[joint.name] + 1.0})
+        for name, other in asm.joints.items():
+            if name not in kin.coupled or other.limits is None:
+                continue
+            r = step[name] - base[name]  # q_c = base_c + r·(q − home), exactly (couplings are affine)
+            if abs(r) < 1e-12:
+                continue
+            a, b = (joint.home + (float(lim) - base[name]) / r for lim in other.limits)
+            first = first or (a, b)
+            lo, hi = max(lo, min(a, b)), min(hi, max(a, b))
+    if lo > hi:  # no range respects every limit: sweep the joint's own range (joint_limit will say why)
+        return _sweep_range(joint)
+    if math.isfinite(lo) and math.isfinite(hi):
+        if joint.limits is None and first is not None and first[0] > first[1]:
+            return (hi, lo)  # follow the coupled joint's lo -> hi
+        return (lo, hi)
+    return _FULL_TURN if joint.kind == "revolute" and joint.limits is None and first is None else None
 
 
 def _loop_groups(loops: list[list[str]]) -> list[set[str]]:
@@ -161,7 +191,7 @@ def _loop_drivers(asm: Assembly, kin: Kinematics, group: set[str]) -> list[str]:
     chosen: list[str] = []
     mobility = kin.mobility(chosen)
     for name in dict.fromkeys(n for tier in tiers for n in tier):
-        if _sweep_range(asm.joints[name]) is None:
+        if _sweep_range(asm.joints[name], kin) is None:
             continue
         m = kin.mobility(chosen + [name])
         if m < mobility:
@@ -175,7 +205,8 @@ def default_studies(asm: Assembly, kin: Kinematics) -> list[Study]:
 
     Every non-loop, non-coupled joint is swept over its limits (revolute without limits 0→360°)
     once in 40 frames; a prismatic joint without limits has no natural range and is left at home.
-    Each group of loops sharing joints is driven through its preferred driver(s) (see
+    Limits of joints it drives through couplings narrow the range (see ``_sweep_range``). Each
+    group of loops sharing joints is driven through its preferred driver(s) (see
     ``_loop_drivers``) over the same ranges in 60 frames. The runner uses these when the script
     declares no study.
     """
@@ -185,13 +216,13 @@ def default_studies(asm: Assembly, kin: Kinematics) -> list[Study]:
     for name, joint in asm.joints.items():
         if joint.kind == "fixed" or name in kin.coupled or name in loop_joints:
             continue
-        rng = _sweep_range(joint)
+        rng = _sweep_range(joint, kin)
         if rng is not None:
             studies.append((order[name], Study(f"sweep_{name}", {name: rng}, frames=_FRAMES_JOINT)))
     for group in _loop_groups(kin.loops):
         drivers = _loop_drivers(asm, kin, group)
         if drivers:
-            drive = {d: _sweep_range(asm.joints[d]) for d in drivers}
+            drive = {d: _sweep_range(asm.joints[d], kin) for d in drivers}
             studies.append((order[drivers[0]], Study("sweep_" + "+".join(drivers), drive, frames=_FRAMES_LOOP)))
     return [s for _, s in sorted(studies, key=lambda item: item[0])]
 
@@ -226,6 +257,7 @@ def check_study(kin: Kinematics, study: Study) -> list[str]:
 
     movable = [n for n, j in asm.joints.items() if j.kind != "fixed"]
     drivers: list[str] = []
+    sampled: dict[str, np.ndarray] = {}
     for name, spec in study.drive.items():
         joint = asm.joints.get(name)
         if joint is None:
@@ -252,14 +284,41 @@ def check_study(kin: Kinematics, study: Study) -> list[str]:
         except Exception as exc:  # user callables may raise anything; report, never propagate
             errors.append(f"{where}: drive for '{name}' failed: {type(exc).__name__}: {exc}")
             continue
+        sampled[name] = vals
         if joint.limits is not None:
             lo, hi = joint.limits
             vmin, vmax = float(vals.min()), float(vals.max())
             if vmin < lo - _LIMIT_TOL or vmax > hi + _LIMIT_TOL:
                 errors.append(f"{where}: '{name}' is driven over {vmin:g}…{vmax:g}{_unit(joint)}, outside its "
                               f"limits [{lo:g}, {hi:g}]{_unit(joint)}")
+    if sampled and len(sampled) == len(drivers):
+        one = _one_pose(kin, sampled)
+        if one is not None:
+            errors.append(f"{where}: {len(u)} frames over {one} sample one pose — use frames ≥ {len(u) + 1}")
     errors.extend(f"{where}: {msg}" for msg in kin.overconstrained(drivers))
     return errors
+
+
+def _one_pose(kin: Kinematics, sampled: dict[str, np.ndarray]) -> str | None:
+    """A moving drive whose frames all land on one pose — every driver, and every joint it drives
+    through couplings, back on its first value (a revolute up to whole turns) — e.g. 2 frames over
+    0…360°. Described as ``0…360° (0° ≡ 360°)``; None when the frames sample more than one pose
+    or nothing moves at all (a hold study)."""
+    n = len(next(iter(sampled.values())))
+    qs = [kin.expand({d: float(v[k]) for d, v in sampled.items()}) for k in range(n)]
+    for name, joint in kin.asm.joints.items():
+        if joint.kind == "fixed" or name not in qs[0]:
+            continue
+        d = np.array([q[name] - qs[0][name] for q in qs])
+        if joint.kind == "revolute":
+            d = d - 360.0 * np.round(d / 360.0)
+        if np.max(np.abs(d)) > _LIMIT_TOL:
+            return None
+    for name, vals in sampled.items():
+        lo, hi = float(vals.min()), float(vals.max())
+        if hi - lo > _LIMIT_TOL:
+            return f"{lo:g}…{hi:g}{_unit(kin.asm.joints[name])} ({lo:g}° ≡ {hi:g}°)"
+    return None  # nothing moves: a study that holds a pose
 
 
 # ------------------------------------------------------------------------------ running
@@ -275,18 +334,24 @@ def _passive_step(kin: Kinematics, drivers: list[str], pose: Pose) -> np.ndarray
     return -np.linalg.pinv(Jp) @ Jd
 
 
-def _branch_jumps(kin: Kinematics, drivers: list[str], poses: list[Pose]) -> list[tuple[int, str, float]]:
+def _branch_jumps(kin: Kinematics, drivers: list[str], poses: list[Pose],
+                  singular: set[int] | None = None) -> list[tuple[int, str, float]]:
     """Passive joints that jump more than 20° / 5 mm between consecutive frames.
 
-    A change that big is only a jump if the drivers' motion doesn't explain it: when both frames
-    are closed, the change predicted by the trapezoidal rule on dq_p/dq_d = −pinv(J_p)·J_d must
-    also miss by more than the threshold. That keeps coarse studies of fast-moving passive joints
-    from being flagged, while a switch of assembly branch (which the tangent never predicts) is.
-    Open frames are judged on the raw change alone.
+    A change that big is only a jump if the drivers' motion doesn't explain it. When both frames
+    are closed, the change must first miss the trapezoidal prediction on dq_p/dq_d =
+    −pinv(J_p)·J_d by more than the threshold. Next to a ``singular`` frame (a change point,
+    where that tangent is meaningless and the branches cross, so a switch needs no big change)
+    every passive joint is judged against the secant through the two frames before instead. A
+    change that still looks wrong is re-traced from the previous frame in fine continuation
+    steps: if that lands on the same values, the passive joint really moves that fast (a coarse
+    study), otherwise the frame switched assembly branch. Open frames are judged on the raw
+    change alone.
     """
     passive = kin.unknowns(drivers)
     if not passive:
         return []
+    singular = set() if singular is None else singular
     limit = np.array([JUMP_DEG if kin.asm.joints[n].kind == "revolute" else JUMP_MM for n in passive])
     slopes: dict[int, np.ndarray | None] = {}
 
@@ -295,32 +360,56 @@ def _branch_jumps(kin: Kinematics, drivers: list[str], poses: list[Pose]) -> lis
             slopes[k] = _passive_step(kin, drivers, poses[k])
         return slopes[k]
 
+    def qv(pose: Pose, names: list[str]) -> np.ndarray:
+        return np.array([pose.q[n] for n in names])
+
     jumps = []
     for k in range(1, len(poses)):
         prev, cur = poses[k - 1], poses[k]
-        dq = np.array([cur.q[n] - prev.q[n] for n in passive])
+        dq = qv(cur, passive) - qv(prev, passive)
         big = np.abs(dq) > limit
-        if not big.any():
+        near_singular = k - 1 in singular or k in singular
+        if not big.any() and not near_singular:
             continue
-        s0, s1 = slope(k - 1), slope(k)
-        if s0 is not None and s1 is not None:
-            dd = np.array([cur.q[d] - prev.q[d] for d in drivers])
-            big &= np.abs(dq - 0.5 * (s0 + s1) @ dd) > limit
+        if prev.ok and cur.ok:
+            dd = qv(cur, drivers) - qv(prev, drivers)
+            s0, s1 = slope(k - 1), slope(k)
+            before = poses[k - 2] if k >= 2 and poses[k - 2].ok else None
+            if near_singular and before is not None:
+                # branches cross at a change point, so a switch there needs no big change: judge
+                # every passive joint against the secant through the two frames before
+                dd_prev = qv(prev, drivers) - qv(before, drivers)
+                denom = float(dd_prev @ dd_prev)
+                if denom > 0:
+                    predicted = (qv(prev, passive) - qv(before, passive)) * float(dd @ dd_prev) / denom
+                    big = np.abs(dq - predicted) > limit
+            elif s0 is not None and s1 is not None:
+                big &= np.abs(dq - 0.5 * (s0 + s1) @ dd) > limit
+            if big.any():
+                # re-trace the step finely along the branch of the frames before it
+                traced = kin.solve({d: cur.q[d] for d in drivers}, prev.q,
+                                   prev=None if before is None else before.q, step_scale=_VERIFY_STEP)
+                if traced.ok:
+                    big &= np.abs(qv(traced, passive) - qv(cur, passive)) > _SAME_BRANCH
         jumps.extend((k, passive[i], float(abs(dq[i]))) for i in np.flatnonzero(big))
     return jumps
 
 
 def run_study(asm: Assembly, kin: Kinematics, study: Study) -> StudyResult:
-    """Solve every frame of ``study`` (frame k warm-starts from frame k−1) and track the probes.
+    """Solve every frame of ``study`` and track the probes.
 
-    Assumes ``check_study`` passed; the first frame is reached from the home pose.
+    Frame k warm-starts from frame k−1, with frames k−2, k−1 as the secant predictor that keeps
+    the branch through singular poses. Assumes ``check_study`` passed; the first frame is reached
+    from the home pose. ``singular`` lists the frames that sit on a change or dead point of the
+    loops the study drives.
     """
     t, drive = sample_drive(study)
+    drivers = list(drive)
     poses: list[Pose] = []
-    guess: dict[str, float] | None = None
     for k in range(len(t)):
-        pose = kin.solve({name: float(v[k]) for name, v in drive.items()}, guess)
-        poses.append(pose)
-        guess = pose.q
+        guess = poses[-1].q if poses else None
+        before = poses[-2].q if len(poses) >= 2 and poses[-2].ok and poses[-1].ok else None
+        poses.append(kin.solve({name: float(v[k]) for name, v in drive.items()}, guess, prev=before))
     probes = {p.name: np.array([kin.point(pose, p.part, p.point) for pose in poses]) for p in asm.probes}
-    return StudyResult(study, t, drive, poses, probes, _branch_jumps(kin, list(drive), poses))
+    singular = [k for k, pose in enumerate(poses) if kin.singular(pose, drivers)]
+    return StudyResult(study, t, drive, poses, probes, _branch_jumps(kin, drivers, poses, set(singular)), singular)

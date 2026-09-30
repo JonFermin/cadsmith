@@ -476,3 +476,138 @@ def test_jacobians_match_finite_differences(builder, driven, drive):
     nxt = kin.solve({driven[0]: drive[driven[0]] + step}, pose.q)
     for k, name in enumerate(unknown):
         assert nxt.q[name] - pose.q[name] == pytest.approx(dq[k], abs=1e-5)
+
+
+# ------------------------------------------------------------------------------ review regressions
+
+
+def planar_four_bar(ground: float, crank: float, coupler: float, rocker: float, th0: float = 0.0,
+                    side: int = +1, t: float = 5.0, absolute: bool = False) -> Assembly:
+    """Four-bar with the crank drawn at th0 (joint home = th0) and B from circle_intersect(side);
+    ``absolute`` makes the rocker's home its drawn angle (else 0: j_rocker = change from home)."""
+    O2, O4 = (0.0, 0.0, 0.0), (ground, 0.0, 0.0)
+    A = (crank * math.cos(math.radians(th0)), crank * math.sin(math.radians(th0)), 0.0)
+    B = circle_intersect(A, coupler, O4, rocker, side=side)
+    asm = Assembly("fb")
+    asm.part("frame", Pos(ground / 2, 0, -2 * t) * Box(ground + 2 * crank + 20, 16, t), ground=True)
+    asm.part("crank", link(O2, A, 10, t, z=0))
+    asm.part("coupler", link(A, B, 10, t, z=t + 0.5))
+    asm.part("rocker", link(O4, B, 10, t, z=2 * t + 1))
+    asm.revolute("j_crank", "frame", "crank", origin=O2, axis=(0, 0, 1), home=th0)
+    asm.revolute("j_coupler", "crank", "coupler", origin=A, axis=(0, 0, 1))
+    asm.revolute("j_rocker", "frame", "rocker", origin=O4, axis=(0, 0, 1),
+                 home=math.degrees(math.atan2(B[1], B[0] - ground)) if absolute else 0.0)
+    asm.pin("p_B", "coupler", "rocker", point=B, axis=(0, 0, 1))
+    return asm
+
+
+@pytest.mark.parametrize("frames, singular", [(73, [24, 60]), (37, [12, 30]), (50, [])])
+def test_parallelogram_keeps_its_branch_at_the_change_points(frames, singular):
+    """crank = rocker = 40, coupler = ground = 100, driven 60 → 420° (review p01): frames landing on
+    the change points (180°, 360°) must not flip to the anti-parallelogram, and are listed."""
+    from mech.assembly import Study
+    from mech.motion import run_study
+
+    asm = planar_four_bar(100, 40, 100, 40, th0=60.0, absolute=True)
+    kin = Kinematics(asm)
+    res = run_study(asm, kin, Study("turn", {"j_crank": (60, 420)}, frames=frames))
+    for pose in res.poses:  # (on a change point the root is double: ~1e-6° is the solver's resolution)
+        assert pose.ok and abs(wrap180(pose.q["j_rocker"] - pose.q["j_crank"])) < 1e-4
+        assert abs(wrap180(pose.q["j_coupler"] + pose.q["j_crank"] - 60.0)) < 1e-4  # coupler stays parallel
+    assert res.branch_jumps == [] and res.singular == singular
+
+
+def test_redundant_parallel_link_is_mobile():
+    """A parallelogram with a third equal parallel link (review p02): Grübler says 0 DOF, but on the
+    constraint manifold it moves — one driver, not overconstrained."""
+    from mech.assembly import Study
+    from mech.motion import check_study, run_study
+
+    th0 = 60.0
+    O2, O4, O6 = (0.0, 0, 0), (100.0, 0, 0), (50.0, 0, 0)
+    pol = lambda c, r, d: (c[0] + r * math.cos(math.radians(d)), c[1] + r * math.sin(math.radians(d)), 0.0)
+    A, B, C = pol(O2, 40, th0), pol(O4, 40, th0), pol(O6, 40, th0)
+    asm = Assembly("double_par")
+    asm.part("frame", Pos(50, 0, -10) * Box(140, 16, 5), ground=True)
+    asm.part("crank", link(O2, A, 10, 5, z=0))
+    asm.part("coupler", link(A, B, 10, 5, z=5.5))
+    asm.part("rocker", link(O4, B, 10, 5, z=11))
+    asm.part("rocker2", link(O6, C, 10, 5, z=11))
+    asm.revolute("j_crank", "frame", "crank", origin=O2, axis=(0, 0, 1), home=th0)
+    asm.revolute("j_coupler", "crank", "coupler", origin=A, axis=(0, 0, 1))
+    asm.revolute("j_rocker", "frame", "rocker", origin=O4, axis=(0, 0, 1), home=th0)
+    asm.revolute("j_rocker2", "frame", "rocker2", origin=O6, axis=(0, 0, 1), home=th0)
+    asm.pin("p_B", "coupler", "rocker", point=B, axis=(0, 0, 1))
+    asm.pin("p_C", "coupler", "rocker2", point=C, axis=(0, 0, 1))
+    kin = Kinematics(asm)
+    assert kin.mobility(["j_crank"]) == 0 and kin.mobility([]) == 1
+    study = Study("open", {"j_crank": (60, 120)}, frames=13)
+    assert kin.overconstrained(["j_crank"]) == [] and check_study(kin, study) == []
+    for pose in run_study(asm, kin, study).poses:
+        assert pose.ok and pose.q["j_rocker"] == pytest.approx(pose.q["j_crank"], abs=1e-6)
+        assert pose.q["j_rocker2"] == pytest.approx(pose.q["j_crank"], abs=1e-6)
+    # over-driving it for real is still caught
+    assert kin.overconstrained(["j_crank", "j_rocker"])
+
+
+def test_spherical_four_bar_is_mobile():
+    """All four hinge axes through one point (review p14): a 1-DOF spherical linkage, not overconstrained."""
+    def u(v):
+        v = np.asarray(v, dtype=float)
+        return v / np.linalg.norm(v)
+
+    R = 50.0
+    a1, a4 = np.array([0.0, 0, 1]), u([math.sin(math.radians(60)), 0, math.cos(math.radians(60))])
+    a2, a3 = u([0, math.sin(math.radians(30)), math.cos(math.radians(30))]), u([0.5, 0.5, 0.8])
+    ball = lambda p: Pos(*(float(x) for x in p)) * Box(4, 4, 4)
+    asm = Assembly("spherical")
+    asm.part("frame", ball(R * a1 * 0.6) + ball(R * a4 * 0.6), ground=True)
+    asm.part("crank", ball(R * a1 * 0.8) + ball(R * a2 * 0.8))
+    asm.part("coupler", ball(R * a2) + ball(R * a3))
+    asm.part("rocker", ball(R * a4 * 0.9) + ball(R * a3 * 0.9))
+    asm.pin_tol = 60.0  # the sketch parts are only markers near the axes
+    asm.revolute("j_crank", "frame", "crank", origin=(0, 0, 0), axis=tuple(a1))
+    asm.revolute("j_coupler", "crank", "coupler", origin=(0, 0, 0), axis=tuple(a2))
+    asm.revolute("j_rocker", "frame", "rocker", origin=(0, 0, 0), axis=tuple(a4))
+    asm.pin("p3", "coupler", "rocker", point=tuple(R * a3), axis=tuple(a3))
+    kin = Kinematics(asm)
+    assert kin.mobility(["j_crank"]) == 0 and kin.overconstrained(["j_crank"]) == []
+    pose = None
+    for th in np.linspace(0, -60, 13):
+        pose = kin.solve({"j_crank": th}, None if pose is None else pose.q)
+        assert pose.ok
+        # the coupler's far axis keeps its angles to the crank axis a2 and the rocker axis a4
+        a2_now = pose.transforms["crank"][:3, :3] @ a2
+        a3_now = pose.transforms["coupler"][:3, :3] @ a3
+        assert a3_now @ a2_now == pytest.approx(a3 @ a2, abs=1e-9)
+        assert a3_now @ a4 == pytest.approx(a3 @ a4, abs=1e-9)
+
+
+def drag_link_follower_deg(theta: float) -> float:
+    """Continuous follower angle change (deg) of the review p26 drag link at crank angle theta."""
+    G, a, b, c = 25.0, 50.0, 60.0, 40.0
+    B0 = circle_intersect((a, 0, 0), b, (G, 0, 0), c, side=+1)
+    prev = math.degrees(math.atan2(B0[1], B0[0] - G))
+    start = prev
+    for th in np.linspace(0.0, theta, max(2, int(abs(theta) * 10) + 1))[1:]:
+        A = (a * math.cos(math.radians(th)), a * math.sin(math.radians(th)), 0.0)
+        B = circle_intersect(A, b, (G, 0, 0), c, side=+1)
+        f = math.degrees(math.atan2(B[1], B[0] - G))
+        prev += wrap180(f - prev)
+    return prev - start
+
+
+@pytest.mark.parametrize("frames", [3, 4, 5, 6])
+def test_coarse_full_turn_unwraps_a_fast_passive_joint(frames):
+    """A drag link's follower turns > 180° between two coarse frames (review p26): the value is the
+    continuous one, not rewound by 360°, and no branch jump is reported."""
+    from mech.assembly import Study
+    from mech.motion import run_study
+
+    asm = planar_four_bar(25, 50, 60, 40)
+    kin = Kinematics(asm)
+    res = run_study(asm, kin, Study("turn", {"j_crank": (0, 360)}, frames=frames))
+    for theta, pose in zip(res.drive["j_crank"], res.poses):
+        assert pose.ok and pose.q["j_rocker"] == pytest.approx(drag_link_follower_deg(theta), abs=1e-3)
+    assert res.poses[-1].q["j_rocker"] == pytest.approx(360.0, abs=1e-3)
+    assert res.branch_jumps == []

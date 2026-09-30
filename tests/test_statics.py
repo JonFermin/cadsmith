@@ -12,6 +12,7 @@ from conftest import FOUR_BAR, make_four_bar
 from mech import Assembly, Kinematics, part_props
 from mech.assembly import Study
 from mech.geom import link
+from mech.materials import get_material
 from mech.motion import run_study
 from mech.statics import gravity_loads
 
@@ -156,3 +157,45 @@ def test_undriven_loop_does_not_block_other_loads():
     series = gravity_loads(asm, kin, res, props)["j_arm"]["series"]
     m, r = props["arm"].mass_kg, 0.05
     np.testing.assert_allclose(series, [m * G * r * math.cos(math.radians(t)) for t in (0, 20, 40, 60)], rtol=1e-9)
+
+
+# ------------------------------------------------------------------------------ review regressions
+
+
+def test_actuator_on_a_passive_loop_joint_gets_the_reflected_load():
+    """Actuator on the crank, study drives the rocker (review p22b): the crank's holding load is
+    reflected by power balance and equals the load of a study that drives the crank itself."""
+    from types import SimpleNamespace
+
+    asm = make_four_bar(**FOUR_BAR)
+    asm.gravity = np.array([0.0, -G, 0.0])
+    for name in ("crank", "coupler", "rocker"):
+        asm.parts[name].material = get_material("steel")
+    kin, props = Kinematics(asm), props_of(asm)
+    res = run_study(asm, kin, Study("rock", {"j_rocker": (-10, 40)}, frames=11))
+    loads = gravity_loads(asm, kin, res, props)
+    crank = loads["j_crank"]
+    assert crank["reflected_from"] == "j_rocker" and crank["max_abs"] > 1e-3
+    # the same poses with the crank as the driver
+    thetas = [p.q["j_crank"] for p in res.poses]
+    direct = SimpleNamespace(drive={"j_crank": np.array(thetas)},
+                             poses=[kin.solve({"j_crank": t}, p.q) for t, p in zip(thetas, res.poses)])
+    expected = gravity_loads(asm, kin, direct, props)["j_crank"]["series"]
+    np.testing.assert_allclose(crank["series"], expected, rtol=1e-6, atol=1e-9)
+
+
+def test_actuator_held_still_by_the_study_is_rated():
+    """A study that drives only the four-bar still loads the actuated serial arm it holds at home."""
+    asm = make_four_bar(**FOUR_BAR)
+    asm.gravity = np.array([0.0, -G, 0.0])
+    asm.part("arm", Pos(20, 0, -15) * Box(40, 6, 4), material="steel")  # along +X from its hinge
+    asm.revolute("j_arm", "frame", "arm", origin=(0, 0, -15), axis=(0, 0, 1))
+    asm.actuator("j_arm", capacity=1.0)
+    kin, props = Kinematics(asm), props_of(asm)
+    res = run_study(asm, kin, Study("turn", {"j_crank": (0, 360)}, frames=7))
+    loads = gravity_loads(asm, kin, res, props)
+    assert list(loads)[:2] == ["j_crank", "j_arm"]
+    arm = loads["j_arm"]
+    assert arm["reflected_from"] is None
+    # V = m g y_com, y_com = 20 sin θ mm: dV/dθ = m g · 0.020 N·m at θ = 0 in every frame
+    np.testing.assert_allclose(arm["series"], props["arm"].mass_kg * G * 0.020, rtol=1e-6)

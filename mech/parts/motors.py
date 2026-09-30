@@ -2,7 +2,8 @@
 
 Convention: mounting face at z=0, body toward −Z, output shaft along +Z on the origin. Frames
 `"shaft"` (origin, +Z) and `"hole_1"`.. (mounting-hole centers on the face, +Z; four for steppers,
-two for servos and the N20). For servos the mounting face is the underside of the ears.
+two for servos and the N20). For servos the mounting face is the underside of the ears, and
+`"horn"` is the spline tip (where a horn seats: z=14.0 for the SG90, 16.4 for the MG996R).
 """
 from __future__ import annotations
 
@@ -83,7 +84,7 @@ def _servo(name: str, body_l: float, body_w: float, below: float, above: float, 
         disk(boss_d, boss_h, above),
         disk(spline_d, spline_h, above + boss_h),
     )
-    frames = {"shaft": z_frame(), **_hole_frames(holes)}
+    frames = {"shaft": z_frame(), "horn": z_frame(0, 0, above + boss_h + spline_h), **_hole_frames(holes)}
     return LibPart(shape, f"{name} servo", mass, frames)
 
 

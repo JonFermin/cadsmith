@@ -15,10 +15,12 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
-from build123d import Axis, Compound, Edge, Location, Vector
+from build123d import Axis, Compound, Edge, Location
 from build123d.topology import Shape
+from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+from OCP.Extrema import Extrema_ExtFlag_MIN
 
-from .geom import from_location, unit, vec3
+from .geom import from_location, inside, unit, vec3
 from .materials import Material, get_material
 
 __all__ = [
@@ -42,13 +44,17 @@ _LOOP_MODES = ("once", "pingpong")
 _METRICS = {
     "span": "joint", "min": "joint", "max": "joint", "load": "joint", "sf": "joint",
     "min_dist": "probe_pair", "max_dist": "probe_pair", "path": "probe", "delta": "probe_axis",
-    "clearance": None, "mass_g": None,
+    "rot": "part", "angle": "part_pair", "clearance": None, "mass_g": None,
 }
 # Coupling kinds with a required (driver kind, driven kind).
-_COUPLING_KINDS = {"gear": ("revolute", "revolute"), "screw": ("revolute", "prismatic"),
-                   "rack": ("revolute", "prismatic")}
-_PARALLEL_TOL = 1e-3  # rad: screw axes must be parallel within this
+_COUPLING_KINDS = {"gear": ("revolute", "revolute"), "belt": ("revolute", "revolute"),
+                   "screw": ("revolute", "prismatic"), "rack": ("revolute", "prismatic")}
+_PARALLEL_TOL = 1e-3  # rad: screw and belt axes must be parallel within this
 _PLANAR_LOOSE, _PLANAR_TIGHT = 1e-3, 1e-9  # rad: near_planar warning band
+_TOUCH = 1e-6  # mm: parts this close at home touch (a bearing on its shaft, a bushing on its rod)
+_MIN_VOLUME = 1e-9  # mm³: a part with less solid volume than this is not a solid
+ALLOW_DEPTH = 0.1  # mm: default max mean overlap depth 2V/A an allow_contact pair may reach
+_TOOTHED = ("gear", "rack")  # LibPart kinds whose teeth mesh through gear/rack couplings
 
 
 class ModelError(Exception):
@@ -69,6 +75,7 @@ class Part:
     opacity: float = 1.0
     mass_g: float | None = None
     bom: str | None = None
+    kind: str | None = None  # LibPart kind: "gear" | "rack" | "pulley" | None
 
 
 @dataclass
@@ -90,7 +97,7 @@ class Coupling:
     driven: str
     ratio: float  # native units: deg/deg, mm/deg, deg/mm or mm/mm
     offset: float = 0.0
-    kind: str = "couple"  # gear | screw | rack | couple
+    kind: str = "couple"  # gear | belt | screw | rack | couple
 
 
 @dataclass
@@ -178,13 +185,18 @@ class Assembly:
         self.studies: list[Study] = []
         self.targets: list[Target] = []
         self.allowed: set[frozenset] = set()
+        self.allow_depth: dict[frozenset, float | None] = {}  # allowed pair -> max mean overlap depth
         self.ignored: set[frozenset] = set()
+        self.checked: set[frozenset] = set()  # check_clearance pairs: joined, but clearance still applies
         self.params: dict = {}  # filled by the runner with the build() keyword values
         self._errors: list[str] = []  # problems found while building; reported by validate()
         # screw/rack ratios depend on joint geometry, so they are (re)computed in validate()
         self._ratio_rules: list[tuple[Coupling, Callable[[], float | None]]] = []
         self._bbox_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._dist_cache: dict[tuple, float] = {}
+        self._touch_cache: dict[tuple, bool] = {}
+        self._solid_cache: dict[int, tuple[object, int, float]] = {}  # id(shape) -> (shape, #solids, volume)
+        self._joined_memo: tuple[tuple, set[frozenset]] | None = None
 
     def __repr__(self) -> str:
         return f"Assembly({self.name!r}: {len(self.parts)} parts, {len(self.joints)} joints, {len(self.pins)} pins)"
@@ -200,9 +212,11 @@ class Assembly:
             raise ValueError(f"duplicate part name '{name}'")
         where = f"part '{name}'"
         shape = shape_or_libpart
+        kind = None
         if not isinstance(shape, Shape) and hasattr(shape, "shape"):  # LibPart: take its defaults
             bom = getattr(shape, "bom", None) if bom is None else bom
             mass_g = getattr(shape, "mass_g", None) if mass_g is None else mass_g
+            kind = getattr(shape, "kind", None)
             shape = shape.shape
         if isinstance(shape, (list, tuple)) and shape and all(isinstance(s, Shape) for s in shape):
             shape = Compound(list(shape))
@@ -221,7 +235,7 @@ class Assembly:
             n_moving = sum(1 for p in self.parts.values() if not p.ground)
             color = _GROUND_COLOR if ground else _PALETTE[n_moving % len(_PALETTE)]
         self.parts[name] = Part(name, shape, mat, str(color), bool(ground), float(opacity),
-                                None if mass_g is None else float(mass_g), bom)
+                                None if mass_g is None else float(mass_g), bom, kind)
         return name
 
     def revolute(self, name: str, parent: str, child: str, origin=None, axis=None, *, at=None,
@@ -243,6 +257,20 @@ class Assembly:
     def gear(self, driver: str, driven: str, ratio: float, *, name: str | None = None) -> str:
         """Revolute→revolute; ``ratio`` assumes co-directional axes (external mesh: negative)."""
         return self._add_coupling("gear", driver, driven, float(ratio), 0.0, name)
+
+    def belt(self, driver: str, driven: str, t_driver: float, t_driven: float, *, name: str | None = None) -> str:
+        """Belt/chain drive between parallel revolute joints: both pulleys turn the same way, ratio
+        = s·t_driver/t_driven (teeth or pitch diameters), s = sign(axis·axis). Never meshing."""
+        cname = self._add_coupling("belt", driver, driven, None, 0.0, name)
+        try:
+            td, tn = float(t_driver), float(t_driven)
+        except (TypeError, ValueError):
+            td = tn = math.nan
+        if not (math.isfinite(td) and math.isfinite(tn) and td > 0 and tn > 0):
+            self._errors.append(f"belt '{cname}': t_driver and t_driven must be > 0 (got {t_driver!r}, {t_driven!r})")
+            td = tn = 1.0
+        self._add_ratio_rule(self.couplings[-1], lambda: self._belt_ratio(driver, driven, td / tn))
+        return cname
 
     def screw(self, driver: str, driven: str, lead: float, *, hand: str = "right", name: str | None = None) -> str:
         """Revolute screw → prismatic nut: ratio = ∓s·lead/360 (right/left hand), s = sign(axis·axis)."""
@@ -303,13 +331,33 @@ class Assembly:
         self.actuators[joint] = Actuator(joint, capacity)
         return joint
 
-    def allow_contact(self, a: str, b: str) -> None:
-        """Parts a and b are expected to touch (contact is OK, overlap still interferes)."""
+    def allow_contact(self, a: str, b: str, *, max_depth: float | None = ALLOW_DEPTH) -> None:
+        """Parts a and b may touch and overlap slightly (a nominal fit, a belt on its pulley).
+
+        Contact and overlaps whose mean depth 2V/A stays within ``max_depth`` mm are ``contact``;
+        a deeper overlap still interferes. ``max_depth=None`` allows any overlap and skips the
+        overlap boolean for the pair (fast; its depth is then never checked).
+        """
         self._add_pair(self.allowed, "allow_contact", a, b)
+        where = f"allow_contact('{a}', '{b}')"
+        if max_depth is not None:
+            try:
+                max_depth = float(max_depth)
+            except (TypeError, ValueError):
+                self._errors.append(f"{where}: max_depth must be a number >= 0 mm or None (got {max_depth!r})")
+                max_depth = ALLOW_DEPTH
+            if not (math.isfinite(max_depth) and max_depth >= 0):
+                self._errors.append(f"{where}: max_depth must be a number >= 0 mm or None (got {max_depth})")
+        self.allow_depth[frozenset((str(a), str(b)))] = max_depth
 
     def ignore(self, a: str, b: str) -> None:
         """Skip the pair a, b in clearance checks entirely."""
         self._add_pair(self.ignored, "ignore", a, b)
+
+    def check_clearance(self, a: str, b: str) -> None:
+        """Hold a joined pair to ``clearance`` anyway (e.g. an arm swinging close to the frame it is
+        hinged to, far from the hinge): the pair is checked like any unjoined pair."""
+        self._add_pair(self.checked, "check_clearance", a, b)
 
     def study(self, name: str, drive: dict, *, frames: int = 60, loop: str = "once", duration: float = 3.0) -> str:
         """Motion study: ``drive`` maps joint -> (start, end) | [(u, v), ...] | callable(u)."""
@@ -414,6 +462,15 @@ class Assembly:
         s = 1.0 if jd.axis @ jn.axis > 0 else -1.0
         return (-1.0 if hand == "right" else 1.0) * s * lead / 360.0
 
+    def _belt_ratio(self, driver: str, driven: str, ratio: float) -> float | None:
+        jd, jn = self.joints.get(driver), self.joints.get(driven)
+        if jd is None or jn is None or (jd.kind, jn.kind) != ("revolute", "revolute"):
+            return None  # reported by the name/kind checks
+        if _angle_between_lines(jd.axis, jn.axis) > _PARALLEL_TOL:
+            raise ValueError(f"pulley axis of '{driver}' {jd.axis.round(4).tolist()} is not parallel to the "
+                             f"pulley axis of '{driven}' {jn.axis.round(4).tolist()}")
+        return ratio if jd.axis @ jn.axis > 0 else -ratio
+
     def _rack_ratio(self, driver: str, driven: str, r: float, sign: int | None) -> float | None:
         jd, jn = self.joints.get(driver), self.joints.get(driven)
         if jd is None or jn is None or (jd.kind, jn.kind) != ("revolute", "prismatic"):
@@ -455,7 +512,8 @@ class Assembly:
     def _distance(self, part: Part, p: np.ndarray, n: np.ndarray | None) -> float:
         """Distance (mm) from ``part`` to the point ``p`` (n None) or to the line through p along n.
 
-        Points buried inside a solid count as distance 0 (OCC's distance only sees the boundary).
+        Points buried inside a solid count as distance 0 (OCC's distance only sees the boundary;
+        containment is classified per solid, see ``geom.inside``).
         """
         lo, hi = self._extent()
         half = self._char_length() + float(np.linalg.norm(p - (lo + hi) / 2))  # line spans the whole assembly
@@ -467,10 +525,10 @@ class Assembly:
                 d = shape.distance_to(Edge.make_line(tuple(p - half * n), tuple(p + half * n)))
                 if d > 0 and self._line_pierces(part, p, n):
                     d = 0.0
-            elif hasattr(shape, "is_inside") and shape.is_inside(Vector(*p)):
+            elif inside(shape, p):
                 d = 0.0
             else:
-                d = shape.distance_to(Vector(*p))
+                d = shape.distance_to(tuple(float(x) for x in p))
             self._dist_cache[key] = float(d)
         return self._dist_cache[key]
 
@@ -481,8 +539,6 @@ class Assembly:
         e.g. a spur gear's own axis through its tooth-symmetric faces reports the root radius — so
         sample ``is_inside`` along the line's chord through the part's bounding box.
         """
-        if not hasattr(part.shape, "is_inside"):
-            return False
         lo, hi = self._bbox(part)
         t0, t1 = -math.inf, math.inf
         for k in range(3):  # slab clipping of p + t·n against the box
@@ -494,7 +550,7 @@ class Assembly:
             t0, t1 = max(t0, min(a, b)), min(t1, max(a, b))
         if t0 > t1:
             return False
-        return any(part.shape.is_inside(Vector(*(p + t * n))) for t in np.linspace(t0, t1, samples + 2)[1:-1])
+        return any(inside(part.shape, p + t * n) for t in np.linspace(t0, t1, samples + 2)[1:-1])
 
     # ---------------------------------------------------------------------------- tree queries
 
@@ -542,39 +598,129 @@ class Assembly:
         return {p: ids.setdefault(find(p), len(ids)) for p in self.parts}
 
     def is_joined(self, a: str, b: str) -> bool:
-        """Same rigid group, or the two groups are connected directly by a joint or pin."""
+        """Is the pair exempt from ``clearance`` (only overlap counts)? True for parts of one rigid
+        group, and for the ``joined_pairs()`` a joint or pin connects directly."""
         g = self.rigid_groups()
         if a not in g or b not in g:
             return False
-        if g[a] == g[b]:
-            return True
-        want = {g[a], g[b]}
-        links = [(j.parent, j.child) for j in self.joints.values()] + [(p.a, p.b) for p in self.pins]
-        return any({g.get(x), g.get(y)} == want for x, y in links)
+        return g[a] == g[b] or frozenset((a, b)) in self.joined_pairs()
+
+    def _links(self) -> list[tuple[str, str, np.ndarray, np.ndarray | None]]:
+        """(part a, part b, point, axis | None) of every moving joint and every pin: the joint's
+        parent/child with its origin + axis line, the pin's parts with its point (+ hinge axis)."""
+        links = [(j.parent, j.child, j.origin, j.axis) for j in self.joints.values() if j.kind != "fixed"]
+        return links + [(p.a, p.b, p.point, p.axis) for p in self.pins]
+
+    def _joined_key(self) -> tuple:
+        return (tuple((n, id(p.shape), p.ground) for n, p in self.parts.items()),
+                tuple((j.name, j.kind, j.parent, j.child, j.origin.tobytes(), j.axis.tobytes())
+                      for j in self.joints.values()),
+                tuple((p.name, p.a, p.b, p.point.tobytes(), None if p.axis is None else p.axis.tobytes())
+                      for p in self.pins),
+                frozenset(self.checked), self.pin_tol)
+
+    def joined_pairs(self) -> set[frozenset]:
+        """Part pairs of two different rigid bodies whose closeness a joint or pin explains.
+
+        A joint (or pin) connects two rigid bodies, but only the parts that carry it bear on each
+        other: the two parts it names (parent/child, pin a/b); on both sides, the parts within
+        ``pin_tol`` of its axis line (ball pin: its point) — shafts, bearings, bushings; and any
+        cross pair that touches at home (a bushing on its guide rod, a large bearing on its
+        shaft). Every other part of the two bodies — posts, brackets and motors on the ground
+        body, anything fixed to a moving link away from its pivot — keeps ``clearance``.
+        ``check_clearance`` pairs are removed. Pairs within one rigid group are not listed
+        (``is_joined`` covers them).
+        """
+        key = self._joined_key()
+        if self._joined_memo is not None and self._joined_memo[0] == key:
+            return self._joined_memo[1]
+        groups = self.rigid_groups()
+        bodies: dict[int, list[str]] = {}
+        for name, g in groups.items():
+            if _is_shape(self.parts[name].shape):
+                bodies.setdefault(g, []).append(name)
+        pairs: set[frozenset] = set()
+        for a, b, point, axis in self._links():
+            if a not in groups or b not in groups or groups[a] == groups[b]:
+                continue
+            pairs.add(frozenset((a, b)))
+            side_a, side_b = bodies.get(groups[a], []), bodies.get(groups[b], [])
+            carry_a = [x for x in side_a if self._carries(x, point, axis)]
+            carry_b = [y for y in side_b if self._carries(y, point, axis)]
+            pairs.update(frozenset((x, y)) for x in carry_a for y in carry_b)
+            pairs.update(frozenset((x, y)) for x in side_a for y in side_b
+                         if frozenset((x, y)) not in pairs and self._touching(x, y))
+        pairs -= self.checked
+        self._joined_memo = (key, pairs)
+        return pairs
+
+    def _carries(self, name: str, point: np.ndarray, axis: np.ndarray | None) -> bool:
+        """Does part ``name`` come within ``pin_tol`` of a joint's axis line (or a ball pin's point)?"""
+        try:
+            return self._distance(self.parts[name], point, axis) <= self.pin_tol
+        except Exception:  # OCC kernel failure: not provably on the axis
+            return False
+
+    def _touching(self, a: str, b: str) -> bool:
+        """Do parts a and b touch (or overlap) at home?"""
+        pa, pb = self.parts[a], self.parts[b]
+        key = (a, id(pa.shape), b, id(pb.shape))
+        if key not in self._touch_cache:
+            (lo_a, hi_a), (lo_b, hi_b) = self._bbox(pa), self._bbox(pb)
+            gap = float(np.linalg.norm(np.maximum(0.0, np.maximum(lo_b - hi_a, lo_a - hi_b))))
+            touching = False
+            if gap <= _TOUCH:
+                try:
+                    ext = BRepExtrema_DistShapeShape(pa.shape.wrapped, pb.shape.wrapped, Extrema_ExtFlag_MIN)
+                    touching = bool(ext.IsDone() and ext.NbSolution() > 0 and ext.Value() <= _TOUCH)
+                except Exception:  # OCC kernel failure: not provably touching
+                    touching = False
+            self._touch_cache[key] = touching
+        return self._touch_cache[key]
 
     def meshing_pairs(self) -> set[frozenset]:
         """Part pairs whose teeth mesh through a gear/rack coupling.
 
-        The two coupled joints move two rigid bodies (their children's rigid groups). A gear is
-        often fixed to a shaft that is the joint's child, so the meshing pairs are the cross pairs
-        of those bodies whose home bounding boxes (inflated by ``clearance``) overlap — the parts
-        that actually engage — with the two joint children as the fallback when none do.
+        The two coupled joints move two rigid bodies (their children's rigid groups). On each
+        side the tooth-bearing candidates are the parts tagged as gears/racks (library
+        ``spur_gear``/``gear_pair``/``rack``); an untagged side offers its joint child when that
+        engages the other side (a gear drawn as the joint's child), else all its parts (a gear
+        fixed to a shaft that is the child). Meshing pairs are the candidate cross pairs whose home
+        bounding boxes (inflated by ``clearance``) overlap — none when nothing engages (a
+        ``gear_mesh`` WARN from ``validate_warnings``). Everything else — a crank fixed to a
+        pinion, the pulleys of a ``belt`` — is clearance-checked normally.
         """
         groups = self.rigid_groups()
-        pairs = set()
+        pairs: set[frozenset] = set()
         for c in self.couplings:
-            jd, jn = self.joints.get(c.driver), self.joints.get(c.driven)
-            if c.kind not in ("gear", "rack") or jd is None or jn is None:
-                continue
-            gd, gn = groups.get(jd.child), groups.get(jn.child)
-            if gd is None or gn is None or gd == gn:
-                continue
-            body_d = [p for p, g in groups.items() if g == gd and _is_shape(self.parts[p].shape)]
-            body_n = [p for p, g in groups.items() if g == gn and _is_shape(self.parts[p].shape)]
-            engaged = {frozenset((a, b)) for a in body_d for b in body_n
-                       if _boxes_overlap(self._bbox(self.parts[a]), self._bbox(self.parts[b]), self.clearance)}
-            pairs |= engaged or {frozenset((jd.child, jn.child))}
+            pairs |= self._coupling_mesh(c, groups) or set()
         return pairs
+
+    def _coupling_mesh(self, c: Coupling, groups: dict[str, int]) -> set[frozenset] | None:
+        """The meshing pairs of one gear/rack coupling (see ``meshing_pairs``); None when the
+        coupling has no teeth to mesh (another kind, unknown joints, or one rigid body)."""
+        jd, jn = self.joints.get(c.driver), self.joints.get(c.driven)
+        if c.kind not in ("gear", "rack") or jd is None or jn is None:
+            return None
+        gd, gn = groups.get(jd.child), groups.get(jn.child)
+        if gd is None or gn is None or gd == gn:
+            return None
+        body_d = [p for p, g in groups.items() if g == gd and _is_shape(self.parts[p].shape)]
+        body_n = [p for p, g in groups.items() if g == gn and _is_shape(self.parts[p].shape)]
+        toothed_d = [p for p in body_d if self.parts[p].kind in _TOOTHED]
+        toothed_n = [p for p in body_n if self.parts[p].kind in _TOOTHED]
+
+        def engage(a: str, b: str) -> bool:
+            return _boxes_overlap(self._bbox(self.parts[a]), self._bbox(self.parts[b]), self.clearance)
+
+        def candidates(body: list[str], toothed: list[str], child: str, other: list[str]) -> list[str]:
+            if toothed:
+                return toothed
+            return [child] if child in body and any(engage(child, o) for o in other) else body
+
+        cand_d = candidates(body_d, toothed_d, jd.child, toothed_n or body_n)
+        cand_n = candidates(body_n, toothed_n, jn.child, toothed_d or body_d)
+        return {frozenset((a, b)) for a in cand_d for b in cand_n if engage(a, b)}
 
     # ---------------------------------------------------------------------------- validation
 
@@ -593,16 +739,25 @@ class Assembly:
         return errors
 
     def _check_parts(self, errors: list[str]) -> None:
+        """Every part must be solid material: clearance, mass properties and STL export need it."""
         for p in self.parts.values():
-            if p.mass_g is not None and _is_shape(p.shape):
+            if not _is_shape(p.shape):
+                continue
+            hit = self._solid_cache.get(id(p.shape))
+            if hit is None or hit[0] is not p.shape:
                 try:
-                    vol = float(p.shape.volume)
+                    solids = p.shape.solids()
+                    hit = (p.shape, len(solids), sum(abs(float(s.volume)) for s in solids))
                 except Exception as exc:  # OCC kernel failure: report, never raise
                     errors.append(f"part '{p.name}': could not compute volume ({exc})")
                     continue
-                if vol <= 1e-9:
-                    errors.append(f"part '{p.name}': mass_g is set but the shape has zero volume "
-                                  f"(mass properties need a solid)")
+                self._solid_cache[id(p.shape)] = hit
+            _, n_solids, vol = hit
+            if vol <= _MIN_VOLUME:
+                what = "contains no solid" if not n_solids else "has zero volume"
+                mass = " (mass_g is set, but mass properties need a solid)" if p.mass_g is not None else ""
+                errors.append(f"part '{p.name}' is not a closed solid: the shape {what}, zero volume{mass} "
+                              f"— did a boolean remove everything, or is it a Face/Shell/Wire?")
 
     def _check_tree(self, errors: list[str]) -> None:
         parts = list(self.parts)
@@ -744,11 +899,16 @@ class Assembly:
                 errors.append(f"actuator: unknown joint '{a.joint}'{_suggest(a.joint, joints)}")
             elif self.joints[a.joint].kind == "fixed":
                 errors.append(f"actuator: joint '{a.joint}' is fixed")
-        for what, bucket in (("allow_contact", self.allowed), ("ignore", self.ignored)):
+        for what, bucket in (("allow_contact", self.allowed), ("ignore", self.ignored),
+                             ("check_clearance", self.checked)):
             for pair in bucket:
                 for x in sorted(pair):
                     if x not in self.parts:
                         errors.append(f"{what}: unknown part '{x}'{_suggest(x, parts)}")
+        for pair in sorted(self.checked & (self.allowed | self.ignored), key=sorted):
+            other = "allow_contact" if pair in self.allowed else "ignore"
+            a, b = sorted(pair)
+            errors.append(f"check_clearance('{a}', '{b}') contradicts {other} for the same pair")
         for s in self.studies:
             where = f"study '{s.name}'"
             if not isinstance(s.drive, dict) or not s.drive:
@@ -788,6 +948,15 @@ class Assembly:
 
         if expects == "joint":
             need(arg.strip(), joints, "joint")
+        elif expects == "part":
+            need(arg.strip(), list(self.parts), "part")
+        elif expects == "part_pair":
+            names = [x.strip() for x in arg.split(",")]
+            if len(names) != 2:
+                errors.append(f"{where}: '{t.metric}' needs two parts: {kind}:<partA>,<partB>")
+            else:
+                for x in names:
+                    need(x, list(self.parts), "part")
         elif expects == "probe":
             need(arg.strip(), probes, "probe")
         elif expects == "probe_pair":
@@ -805,13 +974,21 @@ class Assembly:
                 need(name, probes, "probe")
 
     def validate_warnings(self) -> list[tuple[str, str]]:
-        """Non-fatal findings as (code, message): ``near_planar`` and ``joint_off_part``.
+        """Non-fatal findings as (code, message): ``near_planar``, ``joint_off_part`` and
+        ``gear_mesh`` (a gear/rack coupling whose bodies' teeth do not engage at home).
 
         Returns [] for an invalid model (errors take precedence).
         """
         if self.validate():
             return []
         warnings: list[tuple[str, str]] = []
+        groups = self.rigid_groups()
+        for c in self.couplings:
+            if self._coupling_mesh(c, groups) == set():
+                warnings.append(("gear_mesh",
+                                 f"{c.kind} '{c.name}': nothing moved by '{c.driver}' engages anything moved by "
+                                 f"'{c.driven}' at home (no gear/rack within clearance) — move the gears into mesh, "
+                                 f"or use belt() for a belt/chain drive, couple() for a ratio without modelled teeth"))
         for pin in self.pins:
             loop = [self.joints[j] for j in self._tree_path(pin.a, pin.b)]
             rev_axes = [j.axis for j in loop if j.kind == "revolute"] + ([pin.axis] if pin.axis is not None else [])
@@ -829,10 +1006,10 @@ class Assembly:
                                  f"perpendicular) or the loop may lock"))
         # A joint must touch its parent and child *bodies*: the named part or anything rigidly
         # attached to it (e.g. a shaft whose revolute parent is a plate but which runs in a
-        # bearing fixed to that plate).
-        groups = self.rigid_groups()
+        # bearing fixed to that plate). A prismatic joint's axis line only gives the direction
+        # of travel — where it runs has no kinematic effect — so it is not checked.
         for j in self.joints.values():
-            if j.kind == "fixed":
+            if j.kind != "revolute":
                 continue
             for role, pname in (("parent", j.parent), ("child", j.child)):
                 body = [pname] + [p for p, g in groups.items() if g == groups[pname] and p != pname]
