@@ -87,7 +87,13 @@ def _unit_density_props(shape) -> tuple[float, np.ndarray, np.ndarray]:
 
 
 def part_props(part) -> MassProps:
-    """Mass properties of a ``Part`` at home; ``part.mass_g`` rescales mass and inertia."""
+    """Mass properties of a ``Part`` at home; ``part.mass_g`` rescales mass and inertia.
+
+    A ``virtual`` part (the internal knuckle of a ball joint) is massless: no mass, volume or inertia.
+    """
+    if getattr(part, "virtual", False):
+        bb = part.shape.bounding_box()
+        return MassProps(0.0, 0.0, (vec3(bb.min) + vec3(bb.max)) / 2, np.zeros((3, 3)))
     body = solid_body(part.shape)
     vol, com, J = (0.0, None, np.zeros((3, 3))) if body is None else _unit_density_props(body)
     if vol <= 0:  # no solid material: a massless (or, with mass_g, point-mass) marker at the bbox center
@@ -105,12 +111,13 @@ def part_props(part) -> MassProps:
 
 def assembly_props(asm, props: dict[str, MassProps] | None = None,
                    transforms: dict[str, np.ndarray] | None = None) -> MassProps:
-    """Combined mass properties of ``props`` (default: every part at home) moved by ``transforms``.
+    """Combined mass properties of ``props`` (default: every non-virtual part at home) moved by
+    ``transforms``.
 
     I = Σ [R_i I_i R_iᵀ + m_i (‖d_i‖² E − d_i d_iᵀ)],  d_i = R_i c_i + t_i − c_total.
     """
     if props is None:
-        props = {name: part_props(p) for name, p in asm.parts.items()}
+        props = {name: part_props(p) for name, p in asm.parts.items() if not getattr(p, "virtual", False)}
     transforms = transforms or {}
     items = []
     for name, mp in props.items():

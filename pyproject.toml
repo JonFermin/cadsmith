@@ -31,4 +31,7 @@ build-backend = "hatchling.build"
 packages = ["mech"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "previewer/tests"]
+markers = [
+    "slow: full showcase analyses (minutes); skipped unless -m slow or --runslow",
+]

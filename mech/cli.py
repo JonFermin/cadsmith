@@ -3,7 +3,9 @@
     mech run   <script.py> [-p k=v ...] [--study NAME ...] [--frames N] [--no-export] [--step] [--verbose] [--json]
     mech check <script.py> [-p k=v ...]
     mech sweep <script.py> k=a:b:step k=v1,v2 ... [--frames N] [--export-best]
-    mech shot  <name> [--issue i] [--view iso|top|…] [--ghost N] [--layout quad] [--frame N] [-o out.png]
+    mech shot  <name> [--issue i] [--study S] [--frame N|home] [--q j:v] [--view iso|top|…] [--cam az,el]
+               [--zoom F] [--section x:10] [--focus P] [--isolate P] [--hide P] [--explode F] [--axes]
+               [--ghost N] [--paths 0|1] [--layout quad] [--param k=v] [-o out.png]
     mech list
 
 Exit codes: PASS 0, WARN 1, FAIL 2, INVALID 3 (also: script errors and bad arguments).
@@ -11,6 +13,8 @@ Exit codes: PASS 0, WARN 1, FAIL 2, INVALID 3 (also: script errors and bad argum
 ``build(**params) -> Assembly`` with every tunable as a keyword default; it is imported by path
 with its own directory and the repo root on ``sys.path``. ``--study``/``--frames`` make a run
 partial: it never replaces the last full run's report.json/scene.json (see ``mech.runner``).
+``mech shot`` takes every viewer URL parameter as a flag (``mech.shot.OPTIONS``; values that start
+with ``-`` work as written: ``--section -x:10``, ``--cam -30,20``) plus raw ``--param k=v``.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from .export import ExportError
 from .geom import slug
 from .runner import analyze, check, ensure_utf8_stdio
 from .report import format_check, format_summary
-from .shot import VIEWS, ShotError, shot
+from .shot import OPTIONS, VIEWS, ShotError, shot
 from .sweep import best_variant, format_table, grid, parse_axis, parse_value, run_sweep
 
 __all__ = ["main", "EXIT_CODES"]
@@ -168,9 +172,28 @@ def _cmd_check(args) -> int:
     script = Path(args.script)
     build = _load_build(script, args.verbose)
     asm, params = _build(build, _parse_params(args.p), script, args.verbose)
-    report = _guarded(lambda: check(asm, params=params), script, args.verbose)
-    print(format_check(report, verbose=args.verbose))
+    report = _guarded(lambda: check(asm, params=params, progress=True if args.verbose else None), script,
+                      args.verbose)
+    print(format_check(report, verbose=args.verbose, command=_run_command(args)))
     return EXIT_CODES[report["status"]]
+
+
+def _quoted(word: str) -> str:
+    """``word`` as one shell word (double-quoted when it holds a space or a quote)."""
+    if word and not any(c in word for c in " 	\"'"):
+        return word
+    return '"' + word.replace('"', '\\"') + '"'
+
+
+def _run_command(args) -> str:
+    """The ``uv run mech run`` command line for the script, -p params and --output-dir of a
+    ``mech check`` invocation — its footer's next step, ready to copy."""
+    words = ["uv", "run", "mech", "run", _quoted(str(args.script))]
+    if args.p:
+        words += ["-p", *(_quoted(kv) for kv in args.p)]
+    if Path(args.output_dir).resolve() != (REPO_ROOT / "output").resolve():
+        words += ["--output-dir", _quoted(str(args.output_dir))]
+    return " ".join(words)
 
 
 def _cmd_sweep(args) -> int:
@@ -200,10 +223,25 @@ def _cmd_sweep(args) -> int:
     return EXIT_CODES[best.status]
 
 
+def _shot_options(args) -> tuple[dict, dict]:
+    """(viewer options, raw ``--param k=v`` passthrough) from the parsed ``mech shot`` arguments."""
+    options = {k: getattr(args, k, None) for k in OPTIONS}
+    for key in ("q", "focus", "isolate", "hide"):  # repeatable comma lists
+        if options.get(key):
+            options[key] = ",".join(options[key])
+    params = {}
+    for item in args.param or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise CliError(f"bad --param '{item}': expected key=value")
+        params[key.strip()] = value.strip()
+    return options, params
+
+
 def _cmd_shot(args) -> int:
+    options, params = _shot_options(args)
     try:
-        path = shot(args.name, issue=args.issue, view=args.view, ghost=args.ghost, layout=args.layout,
-                    frame=args.frame, out=args.o, output_dir=args.output_dir)
+        path = shot(args.name, out=args.o, output_dir=args.output_dir, params=params, **options)
     except ShotError as exc:
         raise CliError(str(exc)) from None
     print(path)
@@ -266,7 +304,8 @@ def _parser() -> argparse.ArgumentParser:
         if params:
             p.add_argument("-p", action="extend", nargs="+", default=[], metavar="K=V",
                            help="build() parameter (Python literal, else string); repeatable")
-        p.add_argument("--verbose", action="store_true", help="no line cap; full tracebacks")
+        p.add_argument("--verbose", action="store_true",
+                       help="no line/width cap, sweep stats; per-frame progress on stderr; full tracebacks")
         common(p)
 
     p = sub.add_parser("run", help="analyze a model script and print the summary")
@@ -291,14 +330,32 @@ def _parser() -> argparse.ArgumentParser:
                    help="export the best variant for the viewer (a full run at the declared frames)")
     p.set_defaults(func=_cmd_sweep)
 
-    p = sub.add_parser("shot", help="headless screenshot of output/<name>.mech (needs playwright)")
+    p = sub.add_parser("shot", help="headless screenshot of output/<name>.mech (needs playwright)",
+                       description="Screenshot the viewer. Without options the report's targeted view is shot "
+                                   "(first FAIL/WARN issue, else a ghosted quad overview); any option replaces "
+                                   "that. The file name encodes the options: shot_<study>_f12_top.png.")
     p.add_argument("name", help="mechanism name (output/<name>.mech)")
-    p.add_argument("--issue", type=int, help="focus report.issues[i]")
-    p.add_argument("--view", choices=VIEWS)
+    p.add_argument("--issue", type=int, metavar="I", help="focus report.issues[I]")
+    p.add_argument("--study", metavar="NAME", help="the study to pose (default: the first)")
+    p.add_argument("--frame", metavar="N|home", help="frame N of the chosen study, or 'home' for the drawn pose")
+    p.add_argument("--q", action="append", metavar="JOINT:VALUE[,…]",
+                   help="pose: the frame nearest these joint values (repeatable; not with --frame)")
+    p.add_argument("--view", choices=VIEWS, help="world-plane view: front = the XZ plane, right = the YZ plane")
+    p.add_argument("--cam", metavar="AZ,EL", help="camera azimuth (from +X toward +Y) and elevation, degrees")
+    p.add_argument("--zoom", type=float, metavar="F", help="zoom factor on the auto-fit (2 = twice as close)")
+    p.add_argument("--section", metavar="[-]x|y|z[:OFFSET]", help="section plane; -x keeps the other side")
+    p.add_argument("--focus", action="append", metavar="PART[,…]", help="frame these parts (repeatable)")
+    p.add_argument("--isolate", action="append", metavar="PART[,…]",
+                   help="emphasise these parts: the others are drawn faint, as context (repeatable; --hide "
+                        "removes parts)")
+    p.add_argument("--hide", action="append", metavar="PART[,…]", help="hide these parts (repeatable)")
+    p.add_argument("--explode", type=float, metavar="F", help="explode the parts apart (0…1 and beyond)")
+    p.add_argument("--axes", nargs="?", const="1", metavar="0|1", help="draw the joint axes")
     p.add_argument("--ghost", type=int, metavar="N", help="N translucent poses of the study")
+    p.add_argument("--paths", metavar="0|1", help="draw probe paths (paths=0 hides them)")
     p.add_argument("--layout", choices=("quad",))
-    p.add_argument("--frame", type=int, metavar="N")
-    p.add_argument("-o", metavar="OUT.png", help="output file (default output/<name>.mech/shot_*.png)")
+    p.add_argument("--param", action="append", metavar="K=V", help="any other viewer URL parameter (repeatable)")
+    p.add_argument("-o", metavar="OUT.png", help="output file (default output/<name>.mech/shot_<options>.png)")
     common(p)
     p.set_defaults(func=_cmd_shot)
 
@@ -308,10 +365,28 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
+_DASH_VALUES = ("--section", "--cam")  # values that may start with '-': `--section -x:10`, `--cam -30,20`
+
+
+def _attach_dash_values(argv: list[str]) -> list[str]:
+    """``--section -x:10`` → ``--section=-x:10`` (argparse would read ``-x:10`` as an option)."""
+    out, i = [], 0
+    while i < len(argv):
+        token = argv[i]
+        if token in _DASH_VALUES and i + 1 < len(argv) and argv[i + 1].startswith("-") and len(argv[i + 1]) > 1:
+            out.append(f"{token}={argv[i + 1]}")
+            i += 2
+            continue
+        out.append(token)
+        i += 1
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point of the ``mech`` console script; returns the exit code."""
     ensure_utf8_stdio()
-    args = _parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = _parser().parse_args(_attach_dash_values(argv))
     try:
         return args.func(args)
     except CliError as exc:

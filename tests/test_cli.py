@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -144,7 +145,9 @@ def test_partial_runs_never_replace_the_last_full_run(capsys, tmp_path):
     # the hit between frames 1 and 2, and the issue gives the pose there, not a sampled frame's
     code, out, _ = _run(capsys, "run", TWO, "--frames", "4", "--output-dir", tmp_path)
     assert code == 2 and "(partial run: --frames 4)" in out.splitlines()[0]
-    assert "Δprev: no change (not compared: sweep (19→4 frames), back (19→4 frames))" in out
+    # the coarse run FAILs where the full run did too, but that is not compared: never "no change"
+    assert ("Δprev: no change in the shared scope (not compared: 1 FAIL, sweep (19→4 frames), back (19→4 frames))"
+            in out)
     assert "· between f1–f2 j=45.0° [sweep]" in out
     assert {f: (mech / f).read_bytes() for f in saved} == saved
 
@@ -205,7 +208,9 @@ def test_check(capsys, tmp_path):
     assert code == 0
     lines = out.splitlines()
     assert lines[0].startswith("mech check arm — PASS   3 parts · 2 joints (1 driver, 1 free)")
-    assert "roles j_arm driver · j_block free" in lines and "studies swing mobility 0" in lines
+    assert "roles driver j_arm · free j_block" in lines and "studies swing mobility 0" in lines
+    # the next step is the real command line, ready to copy: script, -p params, --output-dir
+    assert lines[-1] == f"next: uv run mech run {ARM} -p bump=True --output-dir {tmp_path} to run the studies"
     assert not (tmp_path / "arm.mech").exists()  # check never exports
     code, out, _ = _run(capsys, "check", ARM, "-p", "bad_joint=True", "--output-dir", tmp_path)
     assert code == 3 and "INVALID" in out
@@ -284,6 +289,82 @@ def test_shot_query_and_names(tmp_path):
     assert build_query("arm", None) == {"m": "arm", "ui": "0"}
 
 
+def test_shot_options_become_viewer_params_and_the_file_name():
+    """Every viewer parameter is an option (lists joined, booleans 1/0, floats short); raw params pass
+    through; values the viewer would reject fail before a browser starts; the file name encodes
+    the options in a fixed order."""
+    from mech.shot import OPTIONS, shot_suffix
+
+    assert set(OPTIONS) == {"issue", "study", "frame", "q", "view", "cam", "zoom", "section", "focus", "isolate",
+                            "hide", "explode", "axes", "ghost", "paths", "layout"}
+    q = build_query("exc", {"viewer_url": "http://x/mech.html?m=exc&issue=0&ui=0"}, study="dig",
+                    q=["j_boom:30", "j_stick:-10"], view="right", cam="30,20", zoom=2.0, section="-x:12.5",
+                    focus=["bucket", "stick"], isolate="bucket,stick,boom", hide=["cab"], explode=0.5, axes=True,
+                    ghost=3, paths=False, layout="quad", params={"ui": "1", "extra": "y"})
+    assert q == {"m": "exc", "study": "dig", "q": "j_boom:30,j_stick:-10", "view": "right",
+                 "cam": "30,20", "zoom": "2", "section": "-x:12.5", "focus": "bucket,stick",
+                 "isolate": "bucket,stick,boom", "hide": "cab", "explode": "0.5", "axes": "1", "ghost": "3",
+                 "paths": "0", "layout": "quad", "extra": "y", "ui": "0"}  # explicit options replace issue=0
+    # q and frame both pick the frame: the viewer would silently drop the q pose, so it is an error
+    with pytest.raises(ShotError, match="both pick the frame"):
+        build_query("exc", None, study="dig", frame=40, q="j_boom:30")
+    assert build_query("exc", None, frame="home", study="dig") == {"m": "exc", "study": "dig", "frame": "home",
+                                                                   "ui": "0"}
+    assert shot_suffix(build_query("exc", None, study="dig", frame=40, view="top")) == "dig_f40_top"
+    assert shot_suffix(build_query("exc", None, cam="30,20", zoom=1.5)) == "cam30_20_z1_5"
+    assert shot_suffix(build_query("exc", None, isolate="bucket", axes=True, paths=0)) == "only_bucket_axes_paths0"
+    assert shot_suffix(build_query("exc", None, params={"foo": "bar"})) == "foo_bar"
+    assert shot_suffix(build_query("exc", None)) == "default"
+    long = [build_query("exc", None, hide=f"{'part_' * 12}{k}", frame=k) for k in range(2)]
+    names = [shot_suffix(x) for x in long]
+    assert all(len(n) <= 48 for n in names) and names[0] != names[1]  # cut, but never shared
+    for bad, match in [({"view": "diagonal"}, "bad view"), ({"frame": -1}, "bad frame"), ({"frame": "x"}, "bad frame"),
+                       ({"q": "j_boom"}, "bad q"), ({"q": "j:abc"}, "bad q"), ({"cam": "30"}, "bad cam"),
+                       ({"cam": "0,95"}, "elevation"), ({"section": "w:3"}, "bad section"), ({"zoom": 0}, "bad zoom"),
+                       ({"explode": -1}, "bad explode"), ({"axes": "maybe"}, "bad axes"), ({"ghost": 1.5}, "bad ghost"),
+                       ({"layout": "grid"}, "bad layout"), ({"colour": "red"}, "unknown shot option colour")]:
+        with pytest.raises(ShotError, match=match):
+            build_query("exc", None, **bad)
+
+
+def test_shot_cli_flags_reach_the_viewer(capsys, monkeypatch, tmp_path):
+    """`mech shot` flags (repeatable lists merged, --axes without a value, raw --param k=v) arrive as
+    the viewer options; a malformed --param is a usage error."""
+    import mech.cli as cli
+
+    seen = {}
+
+    def fake_shot(name, **kw):
+        seen.update(kw, name=name)
+        return tmp_path / "shot.png"
+
+    monkeypatch.setattr(cli, "shot", fake_shot)
+    code, out, _ = _run(capsys, "shot", "exc", "--study", "dig", "--frame", "40", "--q", "j_boom:30", "--q",
+                        "j_stick:-10", "--focus", "bucket,stick", "--focus", "boom", "--hide", "cab", "--axes",
+                        "--paths", "0", "--zoom", "2", "--cam", "-30,20", "--section", "-x:12.5", "--explode", "0.5",
+                        "--ghost", "3", "--layout", "quad", "--view", "right", "--param", "extra=y",
+                        "--output-dir", tmp_path)
+    assert code == 0 and out.strip() == str(tmp_path / "shot.png")
+    assert seen["name"] == "exc" and seen["params"] == {"extra": "y"}
+    assert {k: seen[k] for k in ("study", "frame", "q", "focus", "hide", "axes", "paths", "zoom", "cam", "section",
+                                 "explode", "ghost", "layout", "view", "isolate", "issue")} == {
+        "study": "dig", "frame": "40", "q": "j_boom:30,j_stick:-10", "focus": "bucket,stick,boom", "hide": "cab",
+        "axes": "1", "paths": "0", "zoom": 2.0, "cam": "-30,20", "section": "-x:12.5", "explode": 0.5, "ghost": 3,
+        "layout": "quad", "view": "right", "isolate": None, "issue": None}
+    code, _, err = _run(capsys, "shot", "exc", "--param", "novalue", "--output-dir", tmp_path)
+    assert code == 3 and "bad --param 'novalue'" in err
+    monkeypatch.undo()
+    _run(capsys, "run", ARM, "--output-dir", tmp_path)
+    code, _, err = _run(capsys, "shot", "arm", "--cam", "0,95", "--output-dir", tmp_path)
+    assert code == 3 and "bad cam=0,95: elevation must be within ±90°" in err  # before any browser starts
+    for argv, message in ((["--study", "swnig"], "unknown study 'swnig' — this run has swing"),
+                          (["--frame", "10"], "frame 10 is past the last frame of study 'swing' (frames 0…9)"),
+                          (["--study", "swing", "--frame", "12"], "frame 12 is past the last frame of study 'swing'"),
+                          (["--issue", "0"], "issue 0 does not exist (the report lists 0)")):
+        code, _, err = _run(capsys, "shot", "arm", *argv, "--output-dir", tmp_path)
+        assert code == 3 and message in err, err
+
+
 def test_shot_server_serves_dist_and_output_only(tmp_path):
     dist, output = tmp_path / "dist", tmp_path / "output"
     (dist / "assets").mkdir(parents=True)
@@ -317,6 +398,102 @@ def test_shot_missing_scene_is_a_clear_error(capsys, tmp_path):
         shot("x", view="diagonal", output_dir=tmp_path)
 
 
+def test_shot_server_swallows_aborted_connections(capsys, monkeypatch, tmp_path):
+    """A browser that drops a connection mid-response (WinError 10053/10054 as the viewer page tears
+    down) is no error: no traceback on stderr, and the server keeps serving."""
+    import http.client
+    from http.server import SimpleHTTPRequestHandler
+
+    from mech.shot import _Server
+
+    dist, output = tmp_path / "dist", tmp_path / "output"
+    dist.mkdir()
+    output.mkdir()
+    (dist / "mech.html").write_text("<html></html>", encoding="utf-8")
+    real_get = SimpleHTTPRequestHandler.do_GET
+
+    def flaky_get(self):
+        if self.path.startswith("/abort"):
+            raise ConnectionAbortedError(10053, "An established connection was aborted by the software in your host")
+        if self.path.startswith("/reset"):
+            raise ConnectionResetError(10054, "An existing connection was forcibly closed by the remote host")
+        return real_get(self)
+
+    monkeypatch.setattr(SimpleHTTPRequestHandler, "do_GET", flaky_get)
+    with serve(dist, output) as base:
+        for path in ("/abort", "/reset"):
+            with pytest.raises((http.client.RemoteDisconnected, ConnectionError, urllib.error.URLError)):
+                urllib.request.urlopen(base + path, timeout=10)
+        with urllib.request.urlopen(base + "/mech.html", timeout=10) as r:
+            assert r.status == 200
+    assert "Traceback" not in capsys.readouterr().err
+
+    server = _Server(("127.0.0.1", 0), SimpleHTTPRequestHandler)  # the server-level net, too
+    try:
+        for exc in (ConnectionAbortedError(10053, "aborted"), BrokenPipeError(32, "broken pipe")):
+            try:
+                raise exc
+            except OSError:
+                server.handle_error(None, ("127.0.0.1", 1))
+        assert capsys.readouterr().err == ""
+        try:
+            raise ValueError("a real bug")
+        except ValueError:
+            server.handle_error(None, ("127.0.0.1", 1))
+        assert "ValueError: a real bug" in capsys.readouterr().err  # real errors still surface
+    finally:
+        server.server_close()
+
+
+class _PlaywrightError(Exception):
+    pass
+
+
+class _Page:
+    """A playwright page stand-in: ``goto`` fails the first ``fail`` times, then the viewer reports
+    ``error`` (None = ready)."""
+
+    def __init__(self, fail: int = 0, error: str | None = None):
+        self.fail, self.error, self.gotos, self.listeners = fail, error, 0, 0
+
+    def on(self, event, handler):
+        self.listeners += 1
+
+    def remove_listener(self, event, handler):
+        self.listeners -= 1
+
+    def goto(self, url, **kw):
+        self.gotos += 1
+        if self.gotos <= self.fail:
+            raise _PlaywrightError("net::ERR_CONNECTION_ABORTED at http://127.0.0.1/mech.html")
+
+    def wait_for_function(self, expr, **kw):
+        pass
+
+    def evaluate(self, expr):
+        return self.error
+
+
+def test_shot_page_load_is_retried_once():
+    from mech.shot import _load_viewer
+
+    page = _Page(fail=1)
+    _load_viewer(page, "http://x/mech.html", 1.0, _PlaywrightError)  # second attempt succeeds
+    assert page.gotos == 2 and page.listeners == 0
+    page = _Page(fail=5)
+    with pytest.raises(ShotError, match="playwright failed: net::ERR_CONNECTION_ABORTED"):
+        _load_viewer(page, "http://x/mech.html", 1.0, _PlaywrightError)
+    assert page.gotos == 2  # once, not forever
+    page = _Page(error="mesh parts/arm.stl: Failed to fetch")
+    with pytest.raises(ShotError, match="Failed to fetch"):
+        _load_viewer(page, "http://x/mech.html", 1.0, _PlaywrightError)
+    assert page.gotos == 2  # a failed data fetch is retried
+    page = _Page(error="bad view=diagonal: expected iso|top|front|right|left|back|bottom")
+    with pytest.raises(ShotError, match="bad view=diagonal"):
+        _load_viewer(page, "http://x/mech.html", 1.0, _PlaywrightError)
+    assert page.gotos == 1  # a bad parameter: retrying cannot help
+
+
 def _viewer_ready() -> bool:
     """playwright importable and previewer/dist current (so the test never runs `npm run build`)."""
     try:
@@ -339,6 +516,21 @@ def test_shot_takes_a_screenshot(capsys, tmp_path):
     assert data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 5000
 
 
+@pytest.mark.skipif(not _viewer_ready(), reason="needs playwright and an up-to-date previewer/dist")
+def test_shot_with_options_names_the_file_by_them(capsys, tmp_path):
+    _run(capsys, "run", TWO, "--output-dir", tmp_path)
+    code, out, err = _run(capsys, "shot", "two", "--study", "back", "--frame", "9", "--view", "top", "--zoom", "2",
+                          "--axes", "--output-dir", tmp_path)
+    if code != 0 and "playwright failed" in err:
+        pytest.skip(f"browser unavailable: {err.strip()}")
+    assert code == 0, err
+    png = Path(out.strip())
+    assert png == (tmp_path / "two.mech" / "shot_back_f9_top_z2_axes.png").resolve()
+    data = png.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 5000
+    assert "Traceback" not in err
+
+
 def test_export_failure_is_one_line_without_traceback(capsys, tmp_path, monkeypatch):
     import mech.export as ex
 
@@ -349,13 +541,117 @@ def test_export_failure_is_one_line_without_traceback(capsys, tmp_path, monkeypa
     assert len(err.strip().splitlines()) == 1
 
 
-def test_verbose_run_prints_study_progress_on_stderr(capsys, tmp_path):
+def test_verbose_run_prints_progress_on_stderr(capsys, tmp_path):
+    """--verbose: the setup, one line per study (fed per frame; where its time went) and the home
+    pose on stderr; `mech check --verbose` one line per step. Quiet without a terminal otherwise."""
     code, out, err = _run(capsys, "run", TWO, "--verbose", "--no-export", "--output-dir", tmp_path)
     lines = err.strip().splitlines()
-    assert len(lines) == 2 and all(line.startswith("study ") and " frames … " in line and line.endswith(" s")
-                                   for line in lines)
+    assert lines[0].startswith("setup (clearance pairs, mass) … ") and lines[0].endswith(" s")
+    assert lines[-1].startswith("home pose clearance … ") and lines[-1].endswith(" s")
+    studies = lines[1:-1]
+    assert [line.split(":")[0] for line in studies] == ["study sweep", "study back"]
+    for line in studies:
+        assert " 19 frames … " in line
+        assert re.search(r" \d+\.\d s \(solve \d+\.\d s, clearance \d+\.\d s, loads \d+\.\d s\)$", line), line
     code, out, err = _run(capsys, "run", TWO, "--no-export", "--output-dir", tmp_path)
     assert err == ""  # not a terminal, not --verbose: quiet
+    code, out, err = _run(capsys, "check", TWO, "--verbose")
+    assert [line.split(" … ")[0] for line in err.strip().splitlines()] == [
+        "check two: validating", "check two: clearance setup", "check two: home pose clearance"]
+    _, _, err = _run(capsys, "check", TWO)
+    assert err == ""
+
+
+class _Stream:
+    """A stderr stand-in that records writes and says whether it is a terminal."""
+
+    def __init__(self, tty: bool):
+        self.tty, self.text = tty, ""
+
+    def isatty(self) -> bool:
+        return self.tty
+
+    def write(self, s: str) -> int:
+        self.text += s
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+
+def _clock():
+    t = iter(range(100))
+    return lambda: float(next(t))
+
+
+def test_study_progress_ticks_per_frame_and_splits_the_time():
+    """Fed progress(stage, done, total) once per frame: off a terminal one dot per 10 % of each
+    stage, on a terminal a live counter; the finished line says where the time went."""
+    from mech.runner import StudyProgress
+
+    stream = _Stream(tty=False)
+    meter = StudyProgress("walk", 4, stream=stream, clock=_clock())  # clock: 0, 1, 2, … s per call
+    meter.begin("solve")
+    for k in range(1, 5):
+        meter("solve", k, 4)
+    meter.begin("clearance")
+    for k in range(1, 5):
+        meter("clearance", k, 4)
+    meter.begin("loads")
+    meter.finish(9.25)
+    assert stream.text == ("study walk: 4 frames … solve ·········· clearance ·········· 9.2 s "
+                           "(solve 1.0 s, clearance 1.0 s, loads 1.0 s)\n")
+    tty = _Stream(tty=True)
+    meter = StudyProgress("walk", 4, stream=tty, clock=_clock())
+    meter("solve", 1, 4)
+    meter("clearance", 12, 4)  # clamped
+    meter.finish(3.0)
+    assert tty.text.split("\r")[1:] == ["study walk: 4 frames … solve 1/4",
+                                         "study walk: 4 frames … clearance 4/4",
+                                         "study walk: 4 frames … 3.0 s (solve 1.0 s, clearance 1.0 s)\n"]
+
+
+def test_step_status_on_a_terminal_is_cleared_for_check():
+    from mech.runner import StepStatus
+
+    tty = _Stream(tty=True)
+    steps = StepStatus("check x: ", stream=tty, keep=False, clock=_clock())
+    with steps.step("validating"):
+        pass
+    with steps.step("home"):
+        pass
+    steps.close()
+    first, second, blank, end = tty.text.split("\r")[1:]
+    assert (first, second.rstrip(), end) == ("check x: validating …", "check x: home …", "")
+    assert len(second) == len(first)  # padded over the longer line before it
+    assert blank == " " * len("check x: home …")  # close() blanks the status line
+    quiet = _Stream(tty=False)
+    with StepStatus(stream=quiet, show=False).step("setup"):
+        pass
+    assert quiet.text == ""
+
+
+def test_call_with_progress_tolerates_stages_without_the_parameter():
+    from mech.runner import call_with_progress
+
+    seen = []
+
+    def old(x):
+        return x + 1
+
+    def new(x, progress=None):
+        progress("solve", 1, 1)
+        return x + 2
+
+    def kw(x, **options):
+        options["progress"]("solve", 1, 1)
+        return x + 3
+
+    tick = lambda *a: seen.append(a)  # noqa: E731
+    assert call_with_progress(old, 1, progress=tick) == 2 and seen == []
+    assert call_with_progress(new, 1, progress=tick) == 3 and call_with_progress(kw, 1, progress=tick) == 4
+    assert seen == [("solve", 1, 1)] * 2
+    assert call_with_progress(old, 1, progress=None) == 2  # no callback: a plain call
 
 
 def test_sweep_ranks_a_missing_safety_factor_below_a_measured_one():
@@ -364,3 +660,16 @@ def test_sweep_ranks_a_missing_safety_factor_below_a_measured_one():
     rows = [Variant({"k": 1}, "PASS", min_clearance=1.0, worst_sf=None),
             Variant({"k": 2}, "PASS", min_clearance=1.0, worst_sf=1.6)]
     assert best_variant(rows).params == {"k": 2}
+
+
+def test_shot_help_says_what_isolate_and_q_do(capsys):
+    """--isolate keeps the other parts as faint context (it never hides them: --hide does), and
+    --q picks the frame, so it does not go with --frame (rejected before a browser starts)."""
+    with pytest.raises(SystemExit):
+        main(["shot", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "show only these parts" not in text
+    assert "the others are drawn faint" in text and "--hide removes parts" in text
+    assert "not with --frame" in text
+    code, _, err = _run(capsys, "shot", "nothing_here", "--q", "j:40", "--frame", "3")
+    assert code == 3 and "both pick the frame" in err

@@ -15,12 +15,15 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
-from build123d import Axis, Compound, Edge, Location
+from build123d import Axis, Compound, Edge, Location, Sphere
 from build123d.topology import Shape
-from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+from OCP.BRep import BRep_Builder
+from OCP.BRepExtrema import BRepExtrema_DistShapeShape, BRepExtrema_ShapeProximity
 from OCP.Extrema import Extrema_ExtFlag_MIN
+from OCP.TopoDS import TopoDS_Compound
 
-from .geom import from_location, inside, unit, vec3
+from .geom import (MESH_DEFLECTION, Mesh, _merge_intervals, axis_cover, from_location, inside, near_cover,
+                   section_radii, section_reach, surface_axes, tessellate, unit, vec3)
 from .materials import Material, get_material
 
 __all__ = [
@@ -52,6 +55,16 @@ _COUPLING_KINDS = {"gear": ("revolute", "revolute"), "belt": ("revolute", "revol
 _PARALLEL_TOL = 1e-3  # rad: screw and belt axes must be parallel within this
 _PLANAR_LOOSE, _PLANAR_TIGHT = 1e-3, 1e-9  # rad: near_planar warning band
 _TOUCH = 1e-6  # mm: parts this close at home touch (a bearing on its shaft, a bushing on its rod)
+# The tessellations sit within their chordal deflection of the true surfaces: meshes farther apart
+# than τ + 2·deflection prove the parts farther apart than τ; twice that again for BRepMesh slack.
+_MESH_MARGIN = 4 * MESH_DEFLECTION
+# A hinge (revolute joint, hinge pin) joins two sides whose material must meet along its axis line
+# (§4.1, ``_hinge_gap``): at most _STACK_GAP·pin_tol apart (washers, spacers), or _THIN_GAPS × the
+# thinner of the two stretches of material (a four-bar's links stacked t apart above its frame).
+# Farther along the line, each side's material belongs to another hinge.
+_STACK_GAP = 2.0
+_THIN_GAPS = 4.0
+_KNUCKLE_R = 0.05  # mm: radius of the virtual knuckle bodies of a ball() joint
 _MIN_VOLUME = 1e-9  # mm³: a part with less solid volume than this is not a solid
 ALLOW_DEPTH = 0.1  # mm: default max mean overlap depth 2V/A an allow_contact pair may reach
 _TOOTHED = ("gear", "rack")  # LibPart kinds whose teeth mesh through gear/rack couplings
@@ -76,6 +89,8 @@ class Part:
     mass_g: float | None = None
     bom: str | None = None
     kind: str | None = None  # LibPart kind: "gear" | "rack" | "pulley" | None
+    # internal knuckle body of a ball() joint: no clearance, mass, export, part count or summary
+    virtual: bool = False
 
 
 @dataclass
@@ -156,6 +171,16 @@ def _is_shape(obj: Any) -> bool:
     return isinstance(obj, Shape) and obj.wrapped is not None
 
 
+def _compound(shapes: Iterable) -> TopoDS_Compound:
+    """An OCC compound of the given TopoDS shapes."""
+    comp = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(comp)
+    for sh in shapes:
+        builder.Add(comp, sh)
+    return comp
+
+
 def _angle_between_lines(a: np.ndarray, b: np.ndarray) -> float:
     """Angle (rad) between two unit directions treated as undirected lines."""
     return math.atan2(float(np.linalg.norm(np.cross(a, b))), abs(float(a @ b)))
@@ -188,6 +213,10 @@ class Assembly:
         self.allow_depth: dict[frozenset, float | None] = {}  # allowed pair -> max mean overlap depth
         self.ignored: set[frozenset] = set()
         self.checked: set[frozenset] = set()  # check_clearance pairs: joined, but clearance still applies
+        self.meshes: set[frozenset] = set()  # mesh() pairs: meshing teeth (interference-only), see meshing_pairs()
+        self.balls: dict[str, tuple[str, str, np.ndarray]] = {}  # ball() name -> (parent, child, center)
+        self.joins: set[frozenset] = set()  # joined() / fasten() / ball() pairs: carried, see joined_pairs()
+        self.fastened: set[frozenset] = set()  # fasten() pairs (also in joins and allowed)
         self.params: dict = {}  # filled by the runner with the build() keyword values
         self._errors: list[str] = []  # problems found while building; reported by validate()
         # screw/rack ratios depend on joint geometry, so they are (re)computed in validate()
@@ -195,6 +224,9 @@ class Assembly:
         self._bbox_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._dist_cache: dict[tuple, float] = {}
         self._touch_cache: dict[tuple, bool] = {}
+        self._mesh_cache: dict[int, tuple[object, Mesh | None]] = {}  # id(shape) -> (shape, tessellation)
+        self._cover_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}  # (part, line) -> axis_cover
+        self._around_cache: dict[tuple, np.ndarray | None] = {}  # (part, point) -> axis it surrounds the point about
         self._solid_cache: dict[int, tuple[object, int, float]] = {}  # id(shape) -> (shape, #solids, volume)
         self._joined_memo: tuple[tuple, set[frozenset]] | None = None
 
@@ -359,6 +391,67 @@ class Assembly:
         hinged to, far from the hinge): the pair is checked like any unjoined pair."""
         self._add_pair(self.checked, "check_clearance", a, b)
 
+    def mesh(self, a: str, b: str) -> None:
+        """Parts a and b mesh (gear teeth, a pinion in a fixed internal ring, a worm): they may
+        touch, any overlap is still an interference. For tooth pairs a gear()/rack() coupling can't
+        name — e.g. planets in a ring gear that is ground (not a revolute child)."""
+        self._add_pair(self.meshes, "mesh", a, b)
+
+    def joined(self, a: str, b: str) -> None:
+        """Parts a and b carry each other across a joint the model doesn't name directly (an arm and
+        the rod on the far side of a ball-joint chain, a hub and the bearing around its shaft):
+        exempt from ``clearance``, any overlap still interferes. ``check_clearance`` undoes it."""
+        self._add_pair(self.joins, "joined", a, b)
+
+    def fasten(self, screw: str, part: str) -> None:
+        """A fastener threaded into a part (a screw in a tapped hole modelled at tap-drill size, a
+        press-fit pin): ``joined`` + ``allow_contact(max_depth=None)`` — the thread overlap is never
+        an interference and the pair is never held to ``clearance``. The two parts must stay rigid
+        together (``fix()`` the screw to the part it threads into, or to what it clamps there):
+        a fastened pair on bodies that move relative to each other is never checked at all, so
+        ``validate_warnings`` flags it (``joint_off_part``)."""
+        self.joined(screw, part)
+        self.allow_contact(screw, part, max_depth=None)
+        self._add_pair(self.fastened, "fasten", screw, part)
+
+    def ball(self, name: str, parent: str, child: str, center, *, axis=None, limits=None) -> str:
+        """Spherical joint at ``center`` (home world): three revolutes ``<name>_1``..``<name>_3``
+        through the center, chained through two tiny ``virtual`` knuckle parts ``<name>_k1``,
+        ``<name>_k2`` (no clearance, mass, export or part count). ``axis`` is the last revolute's
+        axis — the child's spin (default: center → child's bounding-box center, else +Z); the first
+        two are perpendicular to it, so the joint locks (gimbal) only when the child swings 90°
+        off ``axis``. ``limits`` (deg) applies to each revolute. Parent and child are ``joined``.
+        Returns ``name``; drive or pin the three revolutes like any others."""
+        name = str(name)
+        where = f"ball '{name}'"
+        c = self._vec(center, f"{where} center")
+        e3 = None
+        if axis is not None:
+            e3 = self._dir(axis, f"{where} axis")
+        else:
+            part = self.parts.get(str(child))
+            if part is not None and _is_shape(part.shape):
+                lo, hi = self._bbox(part)
+                d = (lo + hi) / 2 - c
+                if float(np.linalg.norm(d)) > 1e-9 * max(float(np.linalg.norm(hi - lo)), 1.0):
+                    e3 = d / float(np.linalg.norm(d))
+            if e3 is None:
+                e3 = np.array([0.0, 0.0, 1.0])
+        helper = np.array([1.0, 0.0, 0.0]) if abs(e3[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(helper, e3)
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(e3, e1)
+        k1, k2 = f"{name}_k1", f"{name}_k2"
+        for k in (k1, k2):
+            self.part(k, Sphere(_KNUCKLE_R).moved(Location(tuple(float(x) for x in c))), color=_GROUND_COLOR)
+            self.parts[k].virtual = True
+        chain = ((str(parent), k1, e1), (k1, k2, e2), (k2, str(child), e3))
+        for i, (a, b, e) in enumerate(chain, start=1):
+            self._motion_joint("revolute", f"{name}_{i}", a, b, c, e, None, limits, 0.0)
+        self.balls[name] = (str(parent), str(child), c)
+        self.joined(parent, child)
+        return name
+
     def study(self, name: str, drive: dict, *, frames: int = 60, loop: str = "once", duration: float = 3.0) -> str:
         """Motion study: ``drive`` maps joint -> (start, end) | [(u, v), ...] | callable(u)."""
         name = str(name)
@@ -509,21 +602,26 @@ class Assembly:
         lo, hi = self._extent()
         return max(float(np.linalg.norm(hi - lo)), 1.0)
 
-    def _distance(self, part: Part, p: np.ndarray, n: np.ndarray | None) -> float:
-        """Distance (mm) from ``part`` to the point ``p`` (n None) or to the line through p along n.
+    def _distance(self, part: Part, p: np.ndarray, n: np.ndarray | None,
+                  span: tuple[float, float] | None = None) -> float:
+        """Distance (mm) from ``part`` to the point ``p`` (n None), to the line through p along n,
+        or — with ``span`` = (t0, t1) — to the segment p + t·n, t0 ≤ t ≤ t1.
 
         Points buried inside a solid count as distance 0 (OCC's distance only sees the boundary;
         containment is classified per solid, see ``geom.inside``).
         """
-        lo, hi = self._extent()
-        half = self._char_length() + float(np.linalg.norm(p - (lo + hi) / 2))  # line spans the whole assembly
+        if n is not None and span is None:
+            lo, hi = self._extent()
+            half = self._char_length() + float(np.linalg.norm(p - (lo + hi) / 2))  # line spans the whole assembly
+            span = (-half, half)
         key = (part.name, id(part.shape), tuple(np.round(p, 9)), None if n is None else tuple(np.round(n, 12)),
-               round(half, 6))
+               None if span is None else (round(span[0], 6), round(span[1], 6)))
         if key not in self._dist_cache:
             shape = part.shape
             if n is not None:
-                d = shape.distance_to(Edge.make_line(tuple(p - half * n), tuple(p + half * n)))
-                if d > 0 and self._line_pierces(part, p, n):
+                t0, t1 = span
+                d = shape.distance_to(Edge.make_line(tuple(p + t0 * n), tuple(p + t1 * n)))
+                if d > 0 and self._line_pierces(part, p, n, span):
                     d = 0.0
             elif inside(shape, p):
                 d = 0.0
@@ -532,25 +630,163 @@ class Assembly:
             self._dist_cache[key] = float(d)
         return self._dist_cache[key]
 
-    def _line_pierces(self, part: Part, p: np.ndarray, n: np.ndarray, samples: int = 9) -> bool:
-        """Does the line (p, n) pass through the interior of ``part``?
+    def _chord(self, part: Part, p: np.ndarray, n: np.ndarray, pad: float = 0.0) -> tuple[float, float] | None:
+        """(t0, t1) where the line p + t·n crosses the part's bounding box inflated by ``pad``; None if it misses."""
+        lo, hi = self._bbox(part)
+        lo, hi = lo - pad, hi + pad
+        t0, t1 = -math.inf, math.inf
+        for k in range(3):  # slab clipping of p + t·n against the box
+            if abs(n[k]) < 1e-12:
+                if not lo[k] <= p[k] <= hi[k]:
+                    return None
+                continue
+            a, b = (lo[k] - p[k]) / n[k], (hi[k] - p[k]) / n[k]
+            t0, t1 = max(t0, min(a, b)), min(t1, max(a, b))
+        return None if t0 > t1 else (t0, t1)
+
+    def _line_pierces(self, part: Part, p: np.ndarray, n: np.ndarray,
+                      span: tuple[float, float] | None = None, samples: int = 9) -> bool:
+        """Does the line (p, n) — or its segment ``span`` — pass through the interior of ``part``?
 
         OCC's line/face extremum can miss a crossing whose face-classification ray grazes a vertex —
         e.g. a spur gear's own axis through its tooth-symmetric faces reports the root radius — so
         sample ``is_inside`` along the line's chord through the part's bounding box.
         """
-        lo, hi = self._bbox(part)
-        t0, t1 = -math.inf, math.inf
-        for k in range(3):  # slab clipping of p + t·n against the box
-            if abs(n[k]) < 1e-12:
-                if not lo[k] <= p[k] <= hi[k]:
-                    return False
-                continue
-            a, b = (lo[k] - p[k]) / n[k], (hi[k] - p[k]) / n[k]
-            t0, t1 = max(t0, min(a, b)), min(t1, max(a, b))
-        if t0 > t1:
+        chord = self._chord(part, p, n)
+        if chord is None:
             return False
+        t0, t1 = chord
+        if span is not None:
+            t0, t1 = max(t0, span[0]), min(t1, span[1])
+            if t0 > t1:
+                return False
         return any(inside(part.shape, p + t * n) for t in np.linspace(t0, t1, samples + 2)[1:-1])
+
+    # ---------------------------------------------------------------------------- hinges along an axis
+
+    def _mesh(self, part: Part) -> Mesh | None:
+        """Cached tessellation of a part's home shape (None if it can't be meshed)."""
+        key = id(part.shape)
+        hit = self._mesh_cache.get(key)
+        if hit is None or hit[0] is not part.shape:
+            try:
+                mesh = tessellate(part.shape, parallel=False)
+            except Exception:  # OCC meshing failure: callers fall back to exact queries
+                mesh = None
+            hit = (part.shape, mesh)
+            self._mesh_cache[key] = hit
+        return hit[1]
+
+    def _cover(self, name: str, p: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``geom.axis_cover`` of part ``name`` along the line (p, n) with radius ``pin_tol`` (+ the
+        mesh margin, so the tessellation never misses a part the exact geometry puts within
+        pin_tol): (near, around) axial intervals, t in mm from p. Cached; empty when the line
+        misses the part."""
+        part = self.parts[name]
+        key = (name, id(part.shape), p.tobytes(), n.tobytes(), self.pin_tol)
+        hit = self._cover_cache.get(key)
+        if hit is None:
+            empty = np.zeros((0, 2))
+            hit = (empty, empty)
+            chord = self._chord(part, p, n, self.pin_tol + _MESH_MARGIN) if _is_shape(part.shape) else None
+            if chord is not None:
+                mesh = self._mesh(part)
+                if mesh is not None and len(mesh.triangles):
+                    hit = axis_cover(mesh, p, n, self.pin_tol + _MESH_MARGIN)
+                else:  # no tessellation: the exact line distance, as one coarse interval
+                    try:
+                        if self._distance(part, p, n) <= self.pin_tol:
+                            hit = (np.array([chord]), empty)
+                    except Exception:  # OCC kernel failure: not provably on the axis
+                        pass
+            self._cover_cache[key] = hit
+        return hit
+
+    def _around_point(self, name: str, p: np.ndarray) -> np.ndarray | None:
+        """An axis through ``p`` about which part ``name``'s material surrounds the point — a socket
+        ring or cup around a ball-pin point: ``geom.axis_cover``'s ``around`` holds at p's level
+        about the axis of one of the part's own revolution faces, or a plane normal, passing within
+        pin_tol of p (``geom.surface_axes``). None when nothing surrounds the point. Cached."""
+        part = self.parts[name]
+        key = (name, id(part.shape), p.tobytes(), self.pin_tol)
+        if key not in self._around_cache:
+            found = None
+            if _is_shape(part.shape):
+                lo, hi = self._bbox(part)
+                pad = self.pin_tol + _MESH_MARGIN
+                if np.all(lo - pad <= p) and np.all(p <= hi + pad):
+                    mesh = self._mesh(part)
+                    if mesh is not None and len(mesh.triangles):
+                        try:
+                            axes = surface_axes(part.shape, p, pad)
+                        except Exception:  # OCC kernel failure: no candidate axes
+                            axes = []
+                        for n in axes:
+                            around = axis_cover(mesh, p, n, pad)[1]
+                            if any(t0 - _MESH_MARGIN <= 0.0 <= t1 + _MESH_MARGIN for t0, t1 in around):
+                                found = n
+                                break
+            self._around_cache[key] = found
+        return self._around_cache[key]
+
+    def _fixed_at_point(self, x: str, p: np.ndarray) -> str | None:
+        """A part rigidly attached to ``x`` whose material is at the point ``p`` (within pin_tol of
+        it or around it) — the part a ball pin naming ``x`` should name instead."""
+        groups = self.rigid_groups()
+        for y, part in self.parts.items():
+            if y == x or groups.get(y) != groups.get(x) or not _is_shape(part.shape):
+                continue
+            try:
+                if self._distance(part, p, None) <= self.pin_tol or self._around_point(y, p) is not None:
+                    return y
+            except Exception:  # OCC kernel failure: not provably at the point
+                continue
+        return None
+
+    def _on_axis(self, side: Iterable[str], p: np.ndarray, n: np.ndarray) -> np.ndarray:
+        """Merged axial intervals (t from p along n) where the parts of ``side`` are at the hinge
+        axis line: within ``pin_tol`` of it or around it (``_cover``: a bore of any size)."""
+        iv = [iv for x in side if x in self.parts for iv in self._cover(x, p, n) if len(iv)]
+        return _merge_intervals(np.vstack(iv)) if iv else np.zeros((0, 2))
+
+    def _hinge_gap(self, side_a: Iterable[str], side_b: Iterable[str], p: np.ndarray, n: np.ndarray
+                   ) -> tuple[float, float] | None:
+        """How far apart along the hinge axis line the two sides' material is where it comes closest
+        — (gap, allowed) — or None when they meet: a gap of at most ``_STACK_GAP``·pin_tol (washers,
+        spacers) or ``_THIN_GAPS`` × the thinner of the two stretches of material (a linkage drawn in
+        one plane with its links stacked above it, a clevis around a lug). Farther apart, each side
+        is on the line only at another hinge (a multi-stub part, a frame with bearing seats along a
+        shaft): nothing joins them here. Also None when a side has no material on the line at all
+        (the caller measures that)."""
+        ia, ib = self._on_axis(side_a, p, n), self._on_axis(side_b, p, n)
+        if not len(ia) or not len(ib):
+            return None
+        best: tuple[float, float] | None = None
+        for a0, a1 in ia:
+            for b0, b1 in ib:
+                gap = max(0.0, max(a0, b0) - min(a1, b1))
+                allowed = max(_STACK_GAP * self.pin_tol, _THIN_GAPS * min(a1 - a0, b1 - b0))
+                if gap <= allowed:
+                    return None
+                if best is None or gap - allowed < best[0] - best[1]:
+                    best = (gap, allowed)
+        return best
+
+    def _off_line(self, side: list[str], p: np.ndarray, n: np.ndarray) -> float | None:
+        """None when a part of ``side`` comes within pin_tol of the hinge's axis line (or around
+        it), else the side's exact distance to the line (inf when not measurable)."""
+        shapes = [x for x in side if x in self.parts and _is_shape(self.parts[x].shape)]
+        if not shapes or len(self._on_axis(shapes, p, n)):
+            return None
+        d = math.inf
+        for x in shapes:
+            try:
+                d = min(d, self._distance(self.parts[x], p, n))
+            except Exception:  # OCC kernel failure: not measurable, try the next part
+                continue
+            if d <= self.pin_tol:
+                return None
+        return d
 
     # ---------------------------------------------------------------------------- tree queries
 
@@ -605,11 +841,14 @@ class Assembly:
             return False
         return g[a] == g[b] or frozenset((a, b)) in self.joined_pairs()
 
-    def _links(self) -> list[tuple[str, str, np.ndarray, np.ndarray | None]]:
-        """(part a, part b, point, axis | None) of every moving joint and every pin: the joint's
-        parent/child with its origin + axis line, the pin's parts with its point (+ hinge axis)."""
-        links = [(j.parent, j.child, j.origin, j.axis) for j in self.joints.values() if j.kind != "fixed"]
-        return links + [(p.a, p.b, p.point, p.axis) for p in self.pins]
+    def _links(self) -> list[tuple[str, str, np.ndarray, np.ndarray | None, bool]]:
+        """(part a, part b, point, axis | None, hinge) of every moving joint and every pin: the
+        joint's parent/child with its origin + axis line, the pin's parts with its point (+ hinge
+        axis). ``hinge`` marks revolute joints and hinge pins (their point is where they are; a
+        prismatic joint's axis line only gives the direction of travel)."""
+        links = [(j.parent, j.child, j.origin, j.axis, j.kind == "revolute")
+                 for j in self.joints.values() if j.kind != "fixed"]
+        return links + [(p.a, p.b, p.point, p.axis, p.axis is not None) for p in self.pins]
 
     def _joined_key(self) -> tuple:
         return (tuple((n, id(p.shape), p.ground) for n, p in self.parts.items()),
@@ -617,18 +856,25 @@ class Assembly:
                       for j in self.joints.values()),
                 tuple((p.name, p.a, p.b, p.point.tobytes(), None if p.axis is None else p.axis.tobytes())
                       for p in self.pins),
-                frozenset(self.checked), self.pin_tol)
+                frozenset(self.checked), frozenset(self.joins), self.pin_tol)
 
     def joined_pairs(self) -> set[frozenset]:
         """Part pairs of two different rigid bodies whose closeness a joint or pin explains.
 
         A joint (or pin) connects two rigid bodies, but only the parts that carry it bear on each
-        other: the two parts it names (parent/child, pin a/b); on both sides, the parts within
-        ``pin_tol`` of its axis line (ball pin: its point) — shafts, bearings, bushings; and any
-        cross pair that touches at home (a bushing on its guide rod, a large bearing on its
-        shaft). Every other part of the two bodies — posts, brackets and motors on the ground
-        body, anything fixed to a moving link away from its pivot — keeps ``clearance``.
-        ``check_clearance`` pairs are removed. Pairs within one rigid group are not listed
+        other: the two parts it names (parent/child, pin a/b); every cross pair of parts within
+        ``pin_tol`` of its axis line (ball pin: its point) — shafts, bearings, bushings; for a
+        slide only the pairs side by side along its line (``_side_by_side``: not an end stop the
+        line runs through); for a hinge, a part that surrounds its axis (a bearing ring or link
+        eye of any bore) with the other side's parts that fill that bore all round to within
+        ``pin_tol`` of its wall (``_inside_bore``: a pin, not an arm turning inside a housing);
+        for a ball pin likewise a part that surrounds its point (a socket ring or cup,
+        ``_around_point``) with the other side's parts reaching within ``pin_tol`` of its wall;
+        and any cross pair that touches at home (a bushing on its guide rod, a large bearing on
+        its shaft). Every other part of the two bodies —
+        posts, brackets and motors on the ground body, anything fixed to a moving link away from
+        its pivot — keeps ``clearance``. Plus the declared ``joined()`` / ``fasten()`` / ``ball()``
+        pairs; ``check_clearance`` pairs are removed. Pairs within one rigid group are not listed
         (``is_joined`` covers them).
         """
         key = self._joined_key()
@@ -640,60 +886,150 @@ class Assembly:
             if _is_shape(self.parts[name].shape):
                 bodies.setdefault(g, []).append(name)
         pairs: set[frozenset] = set()
-        for a, b, point, axis in self._links():
+        for a, b, point, axis, hinge in self._links():
             if a not in groups or b not in groups or groups[a] == groups[b]:
                 continue
             pairs.add(frozenset((a, b)))
             side_a, side_b = bodies.get(groups[a], []), bodies.get(groups[b], [])
-            carry_a = [x for x in side_a if self._carries(x, point, axis)]
-            carry_b = [y for y in side_b if self._carries(y, point, axis)]
-            pairs.update(frozenset((x, y)) for x in carry_a for y in carry_b)
+            carry_a, carry_b = self._carriers(side_a, point, axis), self._carriers(side_b, point, axis)
+            # a slide's line runs on past the slider: only parts side by side along it carry each
+            # other (a guide rod in its bushing, a piston in its barrel — not an end stop or the
+            # crank pivot that the line merely passes through)
+            slide = axis is not None and not hinge
+            pairs.update(frozenset((x, y)) for x in carry_a for y in carry_b
+                         if not slide or self._side_by_side(x, y, point, axis))
+            if hinge:  # a part around the axis carries what runs inside its bore
+                for ring_side, carry, other in ((side_a, carry_a, side_b), (side_b, carry_b, side_a)):
+                    for x in ring_side:
+                        if x not in carry and len(self._cover(x, point, axis)[1]):
+                            pairs.update(frozenset((x, y)) for y in other if self._inside_bore(x, y, point, axis))
+            elif axis is None:  # ball pin: a socket around the point carries the ball that reaches its wall
+                for ring_side, carry, other in ((side_a, carry_a, side_b), (side_b, carry_b, side_a)):
+                    for x in ring_side:
+                        n = None if x in carry else self._around_point(x, point)
+                        if n is not None:
+                            pairs.update(frozenset((x, y)) for y in other if self._inside_bore(x, y, point, n))
             pairs.update(frozenset((x, y)) for x in side_a for y in side_b
                          if frozenset((x, y)) not in pairs and self._touching(x, y))
+        pairs |= {p for p in self.joins if len(p) == 2 and all(x in groups for x in p)
+                  and len({groups[x] for x in p}) == 2}
         pairs -= self.checked
         self._joined_memo = (key, pairs)
         return pairs
 
-    def _carries(self, name: str, point: np.ndarray, axis: np.ndarray | None) -> bool:
-        """Does part ``name`` come within ``pin_tol`` of a joint's axis line (or a ball pin's point)?"""
-        try:
-            return self._distance(self.parts[name], point, axis) <= self.pin_tol
-        except Exception:  # OCC kernel failure: not provably on the axis
+    def _carriers(self, names: list[str], point: np.ndarray, axis: np.ndarray | None) -> list[str]:
+        """The parts of ``names`` within ``pin_tol`` of a joint's axis line (a ball pin: its point).
+
+        The tessellation decides clear cases: within pin_tol − mesh margin is on, beyond pin_tol +
+        margin (``_cover``) is off; only a part in between gets the exact distance.
+        """
+        out = []
+        for x in names:
+            if axis is not None:
+                if not len(self._cover(x, point, axis)[0]):
+                    continue
+                mesh = self._mesh(self.parts[x])
+                if mesh is not None and len(near_cover(mesh, point, axis, self.pin_tol - _MESH_MARGIN)):
+                    out.append(x)
+                    continue
+            try:
+                if self._distance(self.parts[x], point, axis) <= self.pin_tol:
+                    out.append(x)
+            except Exception:  # OCC kernel failure: not provably on the axis
+                continue
+        return out
+
+    def _side_by_side(self, x: str, y: str, point: np.ndarray, axis: np.ndarray) -> bool:
+        """Do parts x and y share a stretch of the line (point, axis) at home — their axial
+        intervals at the line (``_on_axis``: within pin_tol of it or around it) overlapping?"""
+        ix, iy = self._on_axis([x], point, axis), self._on_axis([y], point, axis)
+        return any(max(a0, b0) <= min(a1, b1) + _TOUCH for a0, a1 in ix for b0, b1 in iy)
+
+    def _inside_bore(self, ring: str, y: str, point: np.ndarray, axis: np.ndarray) -> bool:
+        """Does part ``y`` run in ``ring``'s bore: at the axis (near or around it) where ring
+        surrounds it, filling the bore to within ``pin_tol`` of its wall in EVERY direction at
+        the same level (``geom.section_reach``: a pin in an eye, a shaft in a bearing, a ball in
+        its socket — not an arm turning inside a housing's bore whose tip alone comes near the
+        wall, nor a shaft inside a pulley inside a belt, nor a carrier deep inside a housing)?"""
+        around = self._cover(ring, point, axis)[1]
+        near_y, around_y = self._cover(y, point, axis)
+        mesh_r, mesh_y = self._mesh(self.parts[ring]), self._mesh(self.parts[y])
+        if mesh_r is None or mesh_y is None:
             return False
+        for a, b in around:
+            for c, d in (*near_y, *around_y):
+                lo, hi = max(a, c), min(b, d)
+                if lo > hi:
+                    continue
+                for t in (lo + (hi - lo) * f for f in (0.5, 0.25, 0.75)):
+                    rr, reach = section_radii(mesh_r, point, axis, t), section_reach(mesh_y, point, axis, t)
+                    if rr is not None and reach is not None and reach >= rr[0] - self.pin_tol:
+                        return True
+        return False
 
     def _touching(self, a: str, b: str) -> bool:
-        """Do parts a and b touch (or overlap) at home?"""
+        """Do parts a and b touch (or overlap) at home? (boundaries within 1e-6 mm, ``_within``)"""
         pa, pb = self.parts[a], self.parts[b]
         key = (a, id(pa.shape), b, id(pb.shape))
         if key not in self._touch_cache:
-            (lo_a, hi_a), (lo_b, hi_b) = self._bbox(pa), self._bbox(pb)
-            gap = float(np.linalg.norm(np.maximum(0.0, np.maximum(lo_b - hi_a, lo_a - hi_b))))
-            touching = False
-            if gap <= _TOUCH:
-                try:
-                    ext = BRepExtrema_DistShapeShape(pa.shape.wrapped, pb.shape.wrapped, Extrema_ExtFlag_MIN)
-                    touching = bool(ext.IsDone() and ext.NbSolution() > 0 and ext.Value() <= _TOUCH)
-                except Exception:  # OCC kernel failure: not provably touching
-                    touching = False
+            try:
+                touching = self._within(pa, pb, _TOUCH, contained=False)
+            except Exception:  # OCC kernel failure: not provably touching
+                touching = False
             self._touch_cache[key] = touching
         return self._touch_cache[key]
 
+    def _within(self, pa: Part, pb: Part, tol: float, *, contained: bool = True) -> bool:
+        """Do parts a and b come within ``tol`` mm of each other at home (boundary distance; with
+        ``contained`` also when one lies inside the other)?
+
+        Bounding boxes first, then the tessellations: ``BRepExtrema_ShapeProximity`` finds the face
+        pairs whose meshes come within tol + the mesh margin (conservatively — it may report faces
+        that are farther), and only those faces get the exact distance: the closest points of the
+        exact shapes lie on them whenever the shapes are within tol. Gears stay fast.
+        """
+        if self._box_gap(pa, pb) > tol:
+            return False
+        sa, sb = pa.shape.wrapped, pb.shape.wrapped
+        ma, mb = self._mesh(pa), self._mesh(pb)
+        close = True
+        if ma is not None and mb is not None and ma.shape is not None and mb.shape is not None:
+            prox = BRepExtrema_ShapeProximity(ma.shape, mb.shape, tol + _MESH_MARGIN)
+            prox.Perform()
+            near_a, near_b = prox.OverlapSubShapes1(), prox.OverlapSubShapes2()
+            close = near_a.Size() > 0 and near_b.Size() > 0
+            if close:
+                sa = _compound(prox.GetSubShape1(i) for i in range(ma.faces) if near_a.IsBound(i))
+                sb = _compound(prox.GetSubShape2(i) for i in range(mb.faces) if near_b.IsBound(i))
+        if close:
+            ext = BRepExtrema_DistShapeShape(sa, sb, Extrema_ExtFlag_MIN)
+            if ext.IsDone() and ext.NbSolution() > 0 and ext.Value() <= tol:
+                return True
+        if not contained:
+            return False
+        for inner, outer in ((pa, pb), (pb, pa)):  # boundaries apart: one may be buried in the other
+            v = inner.shape.vertices()
+            if v and inside(outer.shape, vec3(v[0])):
+                return True
+        return False
+
     def meshing_pairs(self) -> set[frozenset]:
-        """Part pairs whose teeth mesh through a gear/rack coupling.
+        """Part pairs whose teeth mesh: through a gear/rack coupling, or declared with ``mesh()``.
 
         The two coupled joints move two rigid bodies (their children's rigid groups). On each
         side the tooth-bearing candidates are the parts tagged as gears/racks (library
-        ``spur_gear``/``gear_pair``/``rack``); an untagged side offers its joint child when that
-        engages the other side (a gear drawn as the joint's child), else all its parts (a gear
-        fixed to a shaft that is the child). Meshing pairs are the candidate cross pairs whose home
-        bounding boxes (inflated by ``clearance``) overlap — none when nothing engages (a
-        ``gear_mesh`` WARN from ``validate_warnings``). Everything else — a crank fixed to a
-        pinion, the pulleys of a ``belt`` — is clearance-checked normally.
+        ``spur_gear``/``gear_pair``/``rack``/``internal_gear``); an untagged side offers its
+        joint child when that engages the other side (a gear drawn as the joint's child), else
+        all its parts (a gear fixed to a shaft that is the child). Meshing pairs are the candidate
+        cross pairs whose home bounding boxes (inflated by ``clearance``) overlap — none when
+        nothing engages (a ``gear_mesh`` WARN from ``validate_warnings``). Everything else — a
+        crank fixed to a pinion, the pulleys of a ``belt`` — is clearance-checked normally.
         """
         groups = self.rigid_groups()
         pairs: set[frozenset] = set()
         for c in self.couplings:
             pairs |= self._coupling_mesh(c, groups) or set()
+        pairs |= {p for p in self.meshes if len(p) == 2 and all(x in groups for x in p)}
         return pairs
 
     def _coupling_mesh(self, c: Coupling, groups: dict[str, int]) -> set[frozenset] | None:
@@ -875,19 +1211,46 @@ class Assembly:
             if pin.a == pin.b:
                 errors.append(f"{where}: needs two different parts (got '{pin.a}' twice)")
                 continue
-            for x in known:
-                part = self.parts[x]
-                if not _is_shape(part.shape):
-                    continue
+            known = [x for x in known if _is_shape(self.parts[x].shape)]
+            if pin.axis is not None:
+                self._check_hinge_pin(pin, known, errors)
+                continue
+            for x in known:  # a ball pin's part holds the point, or surrounds it (a socket around the ball)
                 try:
-                    d = self._distance(part, pin.point, pin.axis)
+                    d = self._distance(self.parts[x], pin.point, None)
+                    at_point = d <= self.pin_tol or self._around_point(x, pin.point) is not None
                 except Exception as exc:  # OCC kernel failure: report, never raise
                     errors.append(f"{where}: could not measure distance to part '{x}' ({exc})")
                     continue
-                if d > self.pin_tol:
-                    what = "axis line" if pin.axis is not None else "point"
-                    errors.append(f"pin_off_part: pin '{pin.name}' {what} is {d:.3g} mm from part '{x}' "
-                                  f"(pin_tol {self.pin_tol:g} mm)")
+                if not at_point:
+                    fixed = self._fixed_at_point(x, pin.point)
+                    hint = f" — '{fixed}', fixed to it, is at the point: name that part" if fixed else ""
+                    errors.append(f"pin_off_part: pin '{pin.name}' point is {d:.3g} mm from part '{x}' "
+                                  f"(pin_tol {self.pin_tol:g} mm){hint}")
+
+    def _check_hinge_pin(self, pin: Pin, known: list[str], errors: list[str]) -> None:
+        """A hinge pin threads both its parts: each comes within pin_tol of the axis line or around
+        it (a bore of any size), and the two meet along the line (``_hinge_gap``) — material of one
+        part far along the same line (another station's stub) is not this pin's."""
+        try:
+            off = False
+            for x in known:
+                d = self._off_line([x], pin.point, pin.axis)
+                if d is None:
+                    continue
+                if not math.isfinite(d):
+                    raise RuntimeError(f"no distance to part '{x}'")
+                off = True
+                errors.append(f"pin_off_part: pin '{pin.name}' axis line is {d:.3g} mm from part '{x}' "
+                              f"(pin_tol {self.pin_tol:g} mm)")
+            if not off and len(known) == 2:
+                apart = self._hinge_gap([known[0]], [known[1]], pin.point, pin.axis)
+                if apart is not None:
+                    errors.append(f"pin_off_part: pin '{pin.name}': parts '{known[0]}' and '{known[1]}' meet its "
+                                  f"axis line only {apart[0]:.3g} mm apart along it (at most {apart[1]:.3g} mm: "
+                                  f"2·pin_tol, or 4× the thinner part) — nothing joins them there")
+        except Exception as exc:  # OCC kernel failure: report, never raise
+            errors.append(f"pin '{pin.name}': could not measure distance to its parts ({exc})")
 
     def _check_references(self, errors: list[str]) -> None:
         parts, joints, probes = list(self.parts), list(self.joints), [p.name for p in self.probes]
@@ -900,13 +1263,14 @@ class Assembly:
             elif self.joints[a.joint].kind == "fixed":
                 errors.append(f"actuator: joint '{a.joint}' is fixed")
         for what, bucket in (("allow_contact", self.allowed), ("ignore", self.ignored),
-                             ("check_clearance", self.checked)):
-            for pair in bucket:
+                             ("check_clearance", self.checked), ("mesh", self.meshes), ("joined", self.joins)):
+            for pair in sorted(bucket, key=sorted):
                 for x in sorted(pair):
                     if x not in self.parts:
                         errors.append(f"{what}: unknown part '{x}'{_suggest(x, parts)}")
-        for pair in sorted(self.checked & (self.allowed | self.ignored), key=sorted):
-            other = "allow_contact" if pair in self.allowed else "ignore"
+        for pair in sorted(self.checked & (self.allowed | self.ignored | self.joins | self.meshes), key=sorted):
+            other = next(w for w, b in (("joined", self.joins), ("allow_contact", self.allowed),
+                                        ("ignore", self.ignored), ("mesh", self.meshes)) if pair in b)
             a, b = sorted(pair)
             errors.append(f"check_clearance('{a}', '{b}') contradicts {other} for the same pair")
         for s in self.studies:
@@ -974,8 +1338,11 @@ class Assembly:
                 need(name, probes, "probe")
 
     def validate_warnings(self) -> list[tuple[str, str]]:
-        """Non-fatal findings as (code, message): ``near_planar``, ``joint_off_part`` and
-        ``gear_mesh`` (a gear/rack coupling whose bodies' teeth do not engage at home).
+        """Non-fatal findings as (code, message): ``near_planar``; ``joint_off_part`` (a revolute
+        whose parent or child body is off its axis line, or whose two bodies don't meet along it
+        (``_hinge_gap``), a ball() center away from its parts, a joined()/fasten() pair apart at
+        home); ``gear_mesh`` (a gear/rack coupling whose bodies' teeth do not engage at home, a
+        mesh() pair apart).
 
         Returns [] for an invalid model (errors take precedence).
         """
@@ -1005,28 +1372,139 @@ class Assembly:
                                  f"(> 1e-9, ≤ 1e-3) — make hinge axes exactly parallel (sliders exactly "
                                  f"perpendicular) or the loop may lock"))
         # A joint must touch its parent and child *bodies*: the named part or anything rigidly
-        # attached to it (e.g. a shaft whose revolute parent is a plate but which runs in a
-        # bearing fixed to that plate). A prismatic joint's axis line only gives the direction
-        # of travel — where it runs has no kinematic effect — so it is not checked.
+        # attached to it (e.g. a shaft whose revolute parent is a plate but which runs in a bearing
+        # fixed to that plate), within pin_tol of the axis line or around it (a bore of any size) —
+        # and the two bodies must meet along the line (``_hinge_gap``), not merely each touch it
+        # somewhere. A prismatic joint's axis line only gives the direction of travel — where it
+        # runs has no kinematic effect — so it is not checked. The revolutes inside a ball() are
+        # checked as the ball (its center).
         for j in self.joints.values():
-            if j.kind != "revolute":
+            if j.kind != "revolute" or self.parts[j.parent].virtual or self.parts[j.child].virtual:
+                continue
+            bodies = {role: [pname] + [p for p, g in groups.items() if g == groups[pname] and p != pname]
+                      for role, pname in (("parent", j.parent), ("child", j.child))}
+            try:
+                off = {role: self._off_line(body, j.origin, j.axis) for role, body in bodies.items()}
+                apart = None if any(d is not None for d in off.values()) else \
+                    self._hinge_gap(bodies["parent"], bodies["child"], j.origin, j.axis)
+            except Exception:  # OCC kernel failure: skip the (non-fatal) check
                 continue
             for role, pname in (("parent", j.parent), ("child", j.child)):
-                body = [pname] + [p for p, g in groups.items() if g == groups[pname] and p != pname]
+                d = off[role]
+                if d is not None and math.isfinite(d):
+                    attached = " or anything fixed to it" if len(bodies[role]) > 1 else ""
+                    warnings.append(("joint_off_part",
+                                     f"{j.kind} '{j.name}' axis line is {d:.3g} mm from its {role} '{pname}'"
+                                     f"{attached} (pin_tol {self.pin_tol:g} mm) — check origin/axis"))
+            if apart is not None:
+                warnings.append(("joint_off_part",
+                                 f"{j.kind} '{j.name}': its parent '{j.parent}' and child '{j.child}' (or what is "
+                                 f"fixed to them) meet its axis line only {apart[0]:.3g} mm apart along it (at most "
+                                 f"{apart[1]:.3g} mm: 2·pin_tol, or 4× the thinner part) — nothing joins them there; "
+                                 f"check origin/axis"))
+        warnings += self._ball_warnings(groups)
+        warnings += self._declared_pair_warnings()
+        return warnings
+
+    def _ball_warnings(self, groups: dict[str, int]) -> list[tuple[str, str]]:
+        """``joint_off_part`` for a ball() whose center is farther than pin_tol from its parent or
+        child body and not surrounded by it — a ball pin's rule: a part holds the center when it
+        is within pin_tol of it (buried in material counts) or surrounds it (a socket around the
+        ball, whatever its radius: ``_around_point``)."""
+        out = []
+        for name, (parent, child, c) in self.balls.items():
+            for role, pname in (("parent", parent), ("child", child)):
+                body = [p for p, g in groups.items() if g == groups.get(pname) and not self.parts[p].virtual]
                 d = math.inf
-                for name in body:
-                    part = self.parts[name]
-                    if not _is_shape(part.shape):
+                for x in [pname] + [p for p in body if p != pname]:
+                    if not _is_shape(self.parts[x].shape):
                         continue
                     try:
-                        d = min(d, self._distance(part, j.origin, j.axis))
+                        d = min(d, self._distance(self.parts[x], c, None))
+                        if d > self.pin_tol and self._around_point(x, c) is not None:
+                            d = 0.0  # a socket around the ball holds its center
                     except Exception:  # OCC kernel failure: skip the (non-fatal) check
                         continue
                     if d <= self.pin_tol:
                         break
                 if self.pin_tol < d < math.inf:
                     attached = " or anything fixed to it" if len(body) > 1 else ""
-                    warnings.append(("joint_off_part",
-                                     f"{j.kind} '{j.name}' axis line is {d:.3g} mm from its {role} '{pname}'"
-                                     f"{attached} (pin_tol {self.pin_tol:g} mm) — check origin/axis"))
-        return warnings
+                    out.append(("joint_off_part", f"ball '{name}' center is {d:.3g} mm from its {role} '{pname}'"
+                                                  f"{attached} (pin_tol {self.pin_tol:g} mm) — check center"))
+        return out
+
+    def _declared_pair_warnings(self) -> list[tuple[str, str]]:
+        """``gear_mesh`` for a mesh() pair whose parts don't come within clearance of each other at
+        home; ``joint_off_part`` for a fasten() pair on two bodies that move relative to each other
+        and for a joined()/fasten() pair farther apart than pin_tol."""
+        out = []
+        for pair in sorted(self.meshes, key=sorted):
+            a, b = sorted(pair)
+            pa, pb = self.parts[a], self.parts[b]
+            if not (_is_shape(pa.shape) and _is_shape(pb.shape)):
+                continue
+            # the material, not the boxes: a planet's box always lies inside its ring's
+            if not _boxes_overlap(self._bbox(pa), self._bbox(pb), self.clearance):
+                gap = self._box_gap(pa, pb)
+                at_least = "at least "
+            else:
+                try:
+                    gap = self._gap(pa, pb, self.clearance)
+                except Exception:  # OCC kernel failure: skip the (non-fatal) check
+                    continue
+                at_least = ""
+            if gap is not None:
+                out.append(("gear_mesh", f"mesh('{a}', '{b}'): the parts are {at_least}{gap:.3g} mm apart at home "
+                                         f"(nothing within clearance {self.clearance:g} mm) — move them into mesh"))
+        groups = self.rigid_groups()
+        for pair in sorted(self.fastened, key=sorted):
+            a, b = sorted(pair)
+            if a in groups and b in groups and groups[a] != groups[b]:
+                moving = self._tree_path(a, b)
+                via = f" (through {', '.join(repr(j) for j in moving[:3])}{', …' if len(moving) > 3 else ''})"                     if moving else ""
+                out.append(("joint_off_part", f"fasten('{a}', '{b}'): the parts are on bodies that move relative to "
+                                              f"each other{via}, and a fastened pair is never checked — fix() the "
+                                              f"fastener to the part it threads into"))
+        balls = {frozenset((p, c)) for p, c, _ in self.balls.values()}
+        for pair in sorted(self.joins - balls, key=sorted):
+            a, b = sorted(pair)
+            pa, pb = self.parts[a], self.parts[b]
+            if not (_is_shape(pa.shape) and _is_shape(pb.shape)):
+                continue
+            try:
+                d = self._gap(pa, pb, self.pin_tol)
+            except Exception:  # OCC kernel failure: skip the (non-fatal) check
+                continue
+            if d is not None:
+                out.append(("joint_off_part", f"joined('{a}', '{b}'): the parts are {d:.3g} mm apart at home "
+                                              f"(pin_tol {self.pin_tol:g} mm) — nothing joins them"))
+        return out
+
+    def _box_gap(self, pa: Part, pb: Part) -> float:
+        (lo_a, hi_a), (lo_b, hi_b) = self._bbox(pa), self._bbox(pb)
+        return float(np.linalg.norm(np.maximum(0.0, np.maximum(lo_b - hi_a, lo_a - hi_b))))
+
+    def _gap(self, pa: Part, pb: Part, within: float) -> float | None:
+        """None when parts a and b come within ``within`` mm at home (or one is inside the other),
+        else their distance (mm).
+
+        The closest mesh nodes (points of the true surfaces) bound the distance from above, so
+        only the faces whose meshes come that close can hold the closest points: the exact
+        distance runs on those (a ring gear and a planet: a few faces, not every tooth)."""
+        if self._within(pa, pb, within):
+            return None
+        sa, sb = pa.shape.wrapped, pb.shape.wrapped
+        ma, mb = self._mesh(pa), self._mesh(pb)
+        if (ma is not None and mb is not None and ma.shape is not None and mb.shape is not None
+                and len(ma.vertices) and len(mb.vertices)):
+            from scipy.spatial import cKDTree  # deferred: only the declared-pair warnings need it
+
+            reach = float(cKDTree(ma.vertices).query(mb.vertices)[0].min())
+            prox = BRepExtrema_ShapeProximity(ma.shape, mb.shape, reach + _MESH_MARGIN)
+            prox.Perform()
+            near_a, near_b = prox.OverlapSubShapes1(), prox.OverlapSubShapes2()
+            if near_a.Size() > 0 and near_b.Size() > 0:
+                sa = _compound(prox.GetSubShape1(i) for i in range(ma.faces) if near_a.IsBound(i))
+                sb = _compound(prox.GetSubShape2(i) for i in range(mb.faces) if near_b.IsBound(i))
+        ext = BRepExtrema_DistShapeShape(sa, sb, Extrema_ExtFlag_MIN)
+        return float(ext.Value()) if ext.IsDone() and ext.NbSolution() > 0 else None

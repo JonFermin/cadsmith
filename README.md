@@ -81,8 +81,8 @@ view http://localhost:3000/mech.html?m=four_bar&ghost=6&layout=quad&ui=0 · shot
 
 Exit codes: PASS 0, WARN 1, FAIL 2, INVALID/error 3. Units: mm, degrees, g, N·m / N; Z up.
 `--study`/`--frames` runs are partial: the header says so, targets that need a skipped study are
-"not evaluated", and `output/<name>.mech/` keeps the last full run (what `list`, `shot` and the
-viewer show).
+"not evaluated" (so is any callable target's miss), and `output/<name>.mech/` keeps the last full
+run (what `list`, `shot` and the viewer show).
 
 - **Examples** (`examples/`): `four_bar`, `slider_crank`, `gear_train` (NEMA 17 + 15:30 gears +
   625 bearing), `leadscrew_stage` (T8 screw, LM8UU carriage), `pendulum_arm` (MG996R servo,
@@ -90,14 +90,36 @@ viewer show).
   `parallel_gripper` (SG90 + gear pair + parallelogram jaws that must stay parallel),
   `scissor_lift` (NEMA 17 + T8 screw driving a two-stage scissor, payload, motor SF).
   Each is checked against closed-form truth in `tests/test_examples.py`.
+- **Showcase** (`examples/showcase/`, below): six larger designs, each hand-checked; every one
+  passes `mech check` in the default test run and a full PASS with its headline numbers under
+  `uv run pytest -m slow`.
 - **Standard parts** (`mech.parts`): NEMA 17/23, SG90/MG996R/N20 motors, ball and linear
   bearings, involute spur gears/gear pairs/racks, GT2 pulleys, rods, T8 screw and nut, 2020/2040
   extrusions, ISO fasteners, ISO 286 fits — real dimensions, simplified geometry, attachment frames.
 - **Viewer**: `cd previewer && npm run dev`, then open the `view` URL from the summary
   (`/mech.html?m=<name>`): timeline, ghosts, section plane, explode, issue list that jumps to the
-  offending frame. `npm run build` produces the static bundle `mech shot` uses.
+  offending frame. `npm run build` produces the static bundle `mech shot` uses; every viewer URL
+  parameter (`study`, `frame`, `view`, `cam`, `zoom`, `section`, `focus`, `paths`, …) is also a
+  `mech shot` flag.
 - **Docs**: the contract is `docs/MECH_SPEC.md`; the Claude-facing workflow and API cheat-sheet
   are `.claude/skills/make-mechanism/SKILL.md` and `references/mech-api.md`.
+
+## Showcase
+
+Six mechanisms built with `mech` — each a single script in `examples/showcase/`, analysed with
+`uv run mech run examples/showcase/<name>.py` (PASS, every design target met) and pictured with
+`uv run mech shot` (`--view iso --paths 0`; the gearbox `--section x:13 --cam 25,20`, the arm
+`--hide desk`, the delta `--cam 30,-12`). The number under each is the one its hand check
+reproduces.
+
+| | |
+|---|---|
+| ![strandbeest](docs/img/strandbeest.png) | ![radial engine](docs/img/radial_engine.png) |
+| **Strandbeest** — Jansen linkage, 6 legs on one crank (18 closed loops): stride **67.8 mm**, step lift **22.5 mm** per foot. | **Radial engine** — 5 cylinders, a master rod and 4 articulated rods: strokes **44.000 / 44.049 / 44.156 mm** (master / articulated pairs). |
+| ![planetary gearbox](docs/img/planetary.png) | ![desktop arm](docs/img/desktop_arm.png) |
+| **Planetary gearbox** (cut through stage 1) — two 5:1 stages with internal-gear rings on a NEMA 17: ratio **25:1**, sun holding torque **0.1482 N·m** for a 2.5 kg lever load. | **Desktop arm** — palletizing arm, every motor in the base, belts and three parallelograms: shoulder holding load **0.588 N·m** with a 200 g payload. |
+| ![excavator](docs/img/excavator.png) | ![delta robot](docs/img/delta_robot.png) |
+| **Excavator** — 1:10 hydraulic excavator, four cylinders and the bucket four-bar: boom cylinder pair **340.4 N** at full reach. | **Delta robot** — Clavel delta on six ball-socket rods, IK-driven pick-and-place: max motor load **0.233 N·m**, platform level to 1e-13°. |
 
 ## How it works
 

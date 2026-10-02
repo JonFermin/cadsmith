@@ -14,6 +14,11 @@ does an actuated loop joint the study moves passively (an actuator on the crank 
 whose study drives the rocker). An actuated joint the study holds still (not driven, not on a
 driven loop) gets its own holding load dV/dq, as if it were one more driver: every declared
 actuator is rated in every study.
+
+Loads that are zero by geometry (a hinge axis parallel to gravity, a mass on its own axis) come out
+of the finite differences as round-off (~1e-17 N·m); every load below 1e-9 of the model's gravity
+scale — M·g·Λ for torques, M·g·max(1, Λ) for forces (M = moving mass, Λ = max(L, farthest home
+coordinate) in m) — is reported as exactly 0.0.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ _SI = {"revolute": math.pi / 180.0, "prismatic": 1e-3}  # native unit -> rad | m
 _UNIT = {"revolute": "N·m", "prismatic": "N"}
 _ZERO = 1e-12  # |dq_c/dq_d| (SI) below this: the coupled joint doesn't move with the driver
 _MAX_RTOL = 1e-6  # loads within this relative round-off of the maximum count as reaching it
+_ZERO_RTOL = 1e-9  # loads below this fraction of the model's gravity scale are round-off: exactly 0
 
 
 def _loop_sensitivity(Jp: np.ndarray, Jd: np.ndarray, col_scale: np.ndarray) -> np.ndarray | None:
@@ -141,7 +147,8 @@ def gravity_loads(asm: Assembly, kin: Kinematics, result, props: dict[str, MassP
                 r = S[passive.index(c), :n_study].copy()
             ratios[c].append(r * _SI[joints[c].kind] / to_si)
 
-    out = {d: _entry(joints[d].kind, series, None) for d, series in loads.items()}
+    zero = _zero_loads(asm, kin, masses)
+    out = {d: _entry(joints[d].kind, series, None, zero) for d, series in loads.items()}
     for c in reflect:
         moving = [r for r in ratios[c] if r is not None]
         strength = np.max(np.abs(moving), axis=0) if moving else np.zeros(n_study)
@@ -151,8 +158,18 @@ def gravity_loads(asm: Assembly, kin: Kinematics, result, props: dict[str, MassP
         d = study_drivers[i]
         series = [None if r is None or abs(r[i]) <= _ZERO or load is None else load / float(r[i])
                   for r, load in zip(ratios[c], loads[d])]
-        out[c] = _entry(joints[c].kind, series, d)
+        out[c] = _entry(joints[c].kind, series, d, zero)
     return out
+
+
+def _zero_loads(asm: Assembly, kin: Kinematics, masses: list) -> dict[str, float]:
+    """Per joint kind, the largest |load| that counts as finite-difference round-off: ``_ZERO_RTOL``
+    of the gravity scale M·g·Λ (N·m) or M·g·max(1, Λ) (N), Λ in m. The central differences lose
+    about ε·x/h of a coordinate x (h = 1e-3 deg | mm): ~6e-12·M·g·x N·m and ~1e-10·M·g·x N (x in m)."""
+    weight = float(np.linalg.norm(asm.gravity)) * sum(m for _, m, _ in masses)  # N
+    lo, hi = asm._extent()
+    lam = max(kin.L, float(np.max(np.abs(np.concatenate([lo, hi]))))) * 1e-3  # m
+    return {"revolute": _ZERO_RTOL * weight * lam, "prismatic": _ZERO_RTOL * weight * max(1.0, lam)}
 
 
 def _frame_sensitivity(kin: Kinematics, pose: Pose, drivers: list[str], col_scale: np.ndarray) -> np.ndarray | None:
@@ -163,7 +180,8 @@ def _frame_sensitivity(kin: Kinematics, pose: Pose, drivers: list[str], col_scal
     return _loop_sensitivity(Jp, Jd, col_scale)
 
 
-def _entry(kind: str, series: list[float | None], reflected_from: str | None) -> dict:
+def _entry(kind: str, series: list[float | None], reflected_from: str | None, zero: dict[str, float]) -> dict:
+    series = [None if v is None else (0.0 if abs(v) <= zero[kind] else float(v)) for v in series]
     values = [(abs(v), k) for k, v in enumerate(series) if v is not None]
     max_abs, frame = max(values, key=lambda item: item[0]) if values else (None, None)
     if values:

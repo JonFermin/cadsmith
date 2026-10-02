@@ -14,10 +14,12 @@
 ## Mechanisms (`mech`)
 
 - When the user asks for something that moves (linkage, hinge, lid, gear train, lead screw, servo/motor arm) or about range of motion, collisions, clearances, holding torque or actuator sizing, use the /make-mechanism skill (read its `references/mech-api.md` first)
-- Write the model script to `./output/<name>.py` starting from the closest template in `examples/`; `build()` takes every tunable as a keyword default
+- Write the model script to `./output/<name>.py` starting from the closest template in `examples/` (small, canonical) or `examples/showcase/` (strandbeest, radial_engine, planetary, desktop_arm, excavator, delta_robot: large hand-checked designs to borrow patterns from); `build()` takes every tunable as a keyword default
+- Model fits at nominal size and let the joints carry them; declare `joined` / `mesh` / `fasten` / `ball` / `allow_contact` for what no joint names. Never raise `pin_tol` for a big bore, add 0.1 mm "safety" gaps, or `ignore()` screws — the framework handles those
 - Loop: `uv run mech check output/<name>.py` → `uv run mech run output/<name>.py` → read the ≤15-line summary → edit → rerun (`-p k=v` for quick param changes, `uv run mech sweep` for grids)
 - `--study NAME` / `--frames N` runs are partial: not exported, targets needing skipped studies are "not evaluated" — the verdict (and what you report) comes from a full run
-- Exit codes: PASS 0, WARN 1, FAIL 2, INVALID 3. Results land in `./output/<name>.mech/` (scene.json, report.json, parts/*.stl)
-- `uv run mech shot <name>` only when a picture is needed; read the PNG it prints. Interactive viewer: `cd previewer && npm run dev` → `/mech.html?m=<name>`
-- Always `uv run` (Python 3.12 venv), never system Python or pip; never use bd_warehouse. Tests: `uv run pytest`
+- Exit codes: PASS 0, WARN 1, FAIL 2, INVALID 3. Results land in `./output/<name>.mech/` (scene.json, report.json, series.json, parts/*.stl)
+- `--verbose` shows per-frame progress, where the time went and the sweep stats; `series.json` next to report.json has every per-frame value at full precision — read it instead of re-deriving numbers
+- `uv run mech shot <name>` only when a picture is needed; read the PNG it prints. Every viewer param is a flag (`--study S --frame N|home --view iso --zoom 1.2 --paths 0 --section y --focus P …`). View names are world-plane based (`front` looks along +Y). Interactive viewer: `cd previewer && npm run dev` → `/mech.html?m=<name>`
+- Always `uv run` (Python 3.12 venv), never system Python or pip; never use bd_warehouse. Tests: `uv run pytest` (incl. `previewer/tests`, playwright); `uv run pytest -m slow` (or `--runslow`) adds the full showcase runs (minutes)
 - `docs/MECH_SPEC.md` is the binding contract for the `mech` package

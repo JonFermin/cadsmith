@@ -267,3 +267,131 @@ def test_inside_classifies_each_solid_of_a_compound():
     ring = bearing("608").shape  # three touching solids; (10, 0, 0) lies in the outer ring
     assert not ring.is_inside(Vector(10, 0, 0)) and inside(ring, (10, 0, 0))
     assert not inside(Plane.XY * Rectangle(10, 10), (0, 0, 0))  # no solid, nothing inside
+
+
+# ------------------------------------------------------------------------------ polygon (E5)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_polygon_is_counter_clockwise_whatever_the_point_order(reverse):
+    """A clockwise build123d Polygon(..., align=None) has a −Z face: it extrudes downward and its
+    fuse with a circle goes wrong (review desktop_arm). geom.polygon fixes the winding."""
+    from build123d import Circle, Plane, extrude
+
+    from mech.geom import polygon
+
+    pts = [(0, 0), (30, 0), (30, 10), (20, 10), (20, 5), (10, 5), (10, 10), (0, 10)]  # a U, CCW
+    p = polygon(pts[::-1] if reverse else pts)
+    assert p.faces()[0].normal_at().Z == pytest.approx(1.0)
+    assert p.area == pytest.approx(250.0)
+    lo = extrude(p, 5).bounding_box().min
+    assert (lo.X, lo.Y, lo.Z) == pytest.approx((0, 0, 0))  # points used as given, extruded +Z
+    fused = p + Pos(0, 0) * Circle(2)  # a quarter of the circle sticks out of the corner
+    assert fused.area == pytest.approx(250 + 3 * math.pi, rel=1e-6)
+    on_xz = polygon(pts, plane=Plane.XZ)
+    np.testing.assert_allclose(tuple(on_xz.faces()[0].normal_at()), tuple(Plane.XZ.z_dir), atol=1e-12)
+    assert polygon(pts + [pts[0]]).area == pytest.approx(250.0)  # a repeated closing point is dropped
+
+
+@pytest.mark.parametrize("pts, msg", [
+    ([(0, 0), (10, 0)], "at least 3"),
+    ([(0, 0), (5, 0), (10, 0)], "no area"),
+    ([(0, 0), (10, 10), (10, 0), (0, 12)], "cross"),  # a bow tie
+    ([(0, 0), (10, 0), (10, 10), (0, 10), (5, 0)], "cross"),  # back along the bottom edge
+    ([(0, 0, 1), (1, 0, 1), (0, 1, 1)], "2-D"),
+    ([(0, 0), (1, float("nan")), (0, 1)], "finite"),
+])
+def test_polygon_rejects_bad_outlines(pts, msg):
+    from mech.geom import polygon
+
+    with pytest.raises(ValueError, match=msg):
+        polygon(pts)
+
+
+# ------------------------------------------------------------------------------ tessellations / axis cover
+
+
+def test_tessellate_keeps_the_shape_and_fits_its_surface():
+    from build123d import Cylinder
+
+    from mech.geom import tessellate
+
+    shape = Cylinder(10, 4)
+    mesh = tessellate(shape)
+    assert mesh.shape is not None and mesh.faces == 3 and mesh.triangles.shape[1] == 3
+    r = np.hypot(mesh.vertices[:, 0], mesh.vertices[:, 1])
+    assert r.max() == pytest.approx(10.0, abs=1e-9)  # vertices on the true surface
+    assert len(shape.faces()) == 3 and not hasattr(shape.wrapped, "_mesh")  # the shape itself untouched
+
+
+def test_axis_cover_near_and_around():
+    """near = within the radius of the line; around = the section surrounds the line (any bore)."""
+    from build123d import Cylinder
+
+    from mech.geom import axis_cover, section_radii, tessellate
+
+    ring = tessellate(Cylinder(10, 4) - Cylinder(8, 6))  # z −2…2, bore r = 8
+    near, around = axis_cover(ring, (0, 0, 0), (0, 0, 1), 5.0)
+    assert near.size == 0
+    np.testing.assert_allclose(around, [[-2.0, 2.0]])
+    near, around = axis_cover(ring, (0, 0, 0), (0, 0, 1), 8.5)  # the bore is within 8.5
+    np.testing.assert_allclose(near, [[-2.0, 2.0]])
+    assert section_radii(ring, (0, 0, 0), (0, 0, 1), 1.0) == pytest.approx((8.0, 10.0), abs=0.01)
+    assert section_radii(ring, (0, 0, 0), (0, 0, 1), 3.0) is None
+    # a line through the wall: the material pierced by the line surrounds it there (the curved
+    # wall has many vertex levels along x, so 128 resampled levels: 20/128 mm resolution)
+    near, around = axis_cover(ring, (0, 0, 0), (1, 0, 0), 1.0)
+    np.testing.assert_allclose(around, [[-10.0, -8.0], [8.0, 10.0]], atol=20 / 128)
+    # a C-ring (slit 1 mm) is not around; neither is a ring beside the line
+    slit = tessellate((Cylinder(10, 4) - Cylinder(8, 6)) - Pos(10, 0, 0) * Box(6, 1, 10))
+    assert all(a.size == 0 for a in axis_cover(slit, (0, 0, 0), (0, 0, 1), 5.0))
+    assert all(a.size == 0 for a in axis_cover(ring, (30, 0, 0), (0, 0, 1), 5.0))
+
+
+def test_axis_cover_three_pins_round_an_axis_do_not_surround_it():
+    """Regression: an angle of −1e-17 rad wrapped to exactly 2π covered every bin."""
+    from build123d import Compound, Cylinder
+
+    from mech.geom import axis_cover, tessellate
+
+    pins = Compound([Rot(0, 90, 0) * Pos(15 * math.cos(a), 15 * math.sin(a), 0) * Cylinder(1.5, 14)
+                     for a in (0.0, 2 * math.pi / 3, 4 * math.pi / 3)])
+    near, around = axis_cover(tessellate(pins), (0, 0, 0), (1, 0, 0), 5.0)
+    assert near.size == 0 and around.size == 0
+
+
+def test_surface_axes_lists_revolution_axes_and_plane_normals_near_a_point():
+    """The directions a part may surround a point about (a ball in a socket ring): axes of its
+    surfaces of revolution passing within the radius of the point, normals of its planar faces
+    within the radius; parallel directions once."""
+    from build123d import Cylinder
+
+    from mech.geom import surface_axes
+
+    ring = Rot(90, 0, 0) * (Cylinder(10, 4) - Cylinder(8, 6))  # axis along world Y
+    axes = surface_axes(ring, (0, 0, 0), 5.0)  # the bore/OD axis (Y) runs through the point
+    assert len(axes) == 1 and abs(axes[0] @ (0, 1, 0)) == pytest.approx(1.0)
+    # the end faces' planes (y = ±2) pass within 5 of the point too: the same Y, listed once; far
+    # from the axis and from those planes nothing qualifies
+    assert surface_axes(ring, (30, 30, 0), 5.0) == []
+    box = Box(10, 20, 40)  # faces 5, 10, 20 mm from the centre: only the x faces are within 6
+    axes = surface_axes(box, (0, 0, 0), 6.0)
+    assert len(axes) == 1 and abs(axes[0] @ (1, 0, 0)) == pytest.approx(1.0)
+
+
+def test_section_reach_is_how_far_the_section_fills_every_direction():
+    """A journal reaches its radius all round; an arm off a hub reaches only the hub's radius in
+    most directions, however long it is; a flat bar through the axis reaches its half thickness;
+    a ring reaches its outer radius; a part off the axis reaches 0 in the directions it misses."""
+    from build123d import Cylinder
+
+    from mech.geom import section_reach, tessellate
+
+    z = ((0, 0, 0), (0, 0, 1))
+    assert section_reach(tessellate(Cylinder(6, 10)), *z, 0.0) == pytest.approx(6.0, abs=0.02)
+    rotor = tessellate(Cylinder(3, 10) + Pos(9.9, 0, 0) * Box(19.8, 2, 4))
+    assert section_reach(rotor, *z, 0.0) == pytest.approx(3.0, abs=0.02)
+    assert section_reach(tessellate(Box(40, 2, 4)), *z, 0.0) == pytest.approx(1.0, abs=0.05)
+    assert section_reach(tessellate(Cylinder(10, 6) - Cylinder(8, 8)), *z, 0.0) == pytest.approx(10.0, abs=0.02)
+    assert section_reach(tessellate(Pos(20, 0, 0) * Box(4, 4, 4)), *z, 0.0) == 0.0
+    assert section_reach(tessellate(Cylinder(6, 10)), *z, 20.0) is None  # the plane misses it

@@ -47,6 +47,7 @@ _MAX_STEPS = 720
 _PREDICT_RCOND = 1e-6  # pinv cutoff for the tangent predictor (skips near-singular directions)
 _N_PERTURB, _PERTURB_DEG, _PERTURB_FRAC, _SEED = 3, 10.0, 0.05, 0  # generic-rank samples
 _ZERO = 1e-12  # relative magnitude below which a Jacobian entry is structurally zero
+_IDLE_COL = 1e-12  # relative (scaled) column norm below which an unknown doesn't move the residual
 
 
 def driven_block(Jp: np.ndarray, Jd: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -400,7 +401,23 @@ class Kinematics:
         return closest[0] if closest is not None else best[0]
 
     def _correct(self, u0: np.ndarray, uidx: np.ndarray) -> tuple[np.ndarray, float]:
-        """Least-squares closure over the unknowns (revolutes in radians); returns (u, max |r|)."""
+        """Least-squares closure over the unknowns (revolutes in radians); returns (u, max |r|).
+
+        Unknowns the residual does not depend on at ``u0`` (a zero Jacobian column — e.g. the spin
+        of a rod about its own axis between two ball joints) are held at their start values
+        first: least squares would leave them there anyway, but the null direction slows its
+        convergence ~10×. If that reduced solve does not close the loops, all unknowns are solved.
+        """
+        if uidx.size > 1:
+            norms = np.linalg.norm(self._jac(self._q(u0))[:, uidx] * self._col_scale[uidx], axis=0)
+            idle = norms <= _IDLE_COL * float(np.max(norms, initial=0.0))
+            if idle.any() and not idle.all():
+                u, res = self._lsq(u0, uidx[~idle])
+                if res <= RESIDUAL_TOL:
+                    return u, res
+        return self._lsq(u0, uidx)
+
+    def _lsq(self, u0: np.ndarray, uidx: np.ndarray) -> tuple[np.ndarray, float]:
         s = self._to_internal[uidx]
 
         def q_of(x: np.ndarray) -> np.ndarray:

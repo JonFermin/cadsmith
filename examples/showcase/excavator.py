@@ -95,7 +95,7 @@ def dig_depth(report):
 def build(Lb=570.0, Ls=290.0, Ltip=150.0, alpha=5.0, boom_range=(-30.0, 55.0), bend_range=(30.0, 135.0),
           bucket_open=-5.0, bucket_stroke=114.5, Lh=75.0, Lp=90.0, rk=40.0, payload_g=1000.0,
           supply_mpa=1.5, strict=False) -> Assembly:
-    asm = Assembly("showcase_excavator", clearance=0.3, pin_tol=8.0)   # pin_tol > bore radius (6.4)
+    asm = Assembly("excavator", clearance=0.3)                    # 12.8 mm eyes encircle their 12 mm pins: carried
     F = (35.0, 0.0, 215.0)                                        # boom foot pin (world)
     loc_boom = heading(F, alpha)                                  # local x along the boom chord F→S
     S = at(loc_boom, Lb, 0)                                       # boom tip / stick pivot

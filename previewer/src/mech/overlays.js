@@ -6,11 +6,12 @@ import {
 } from 'three';
 import { STATUS_COLORS } from './parts.js';
 import { fmt } from './model.js';
+import { srgb } from './viewer.js';
 
 const PROBE_COLORS = [0x4dd0e1, 0xf06292, 0xffd54f, 0xa5d6a7, 0xb39ddb, 0xffab91];
 const Y = new Vector3(0, 1, 0);
 
-/** Marker material: always drawn on top so an issue is visible through the parts around it. */
+/** Marker material (`color` linear): drawn on top so an issue is visible through the parts around it. */
 const onTop = (color, opacity = 0.95) => new MeshBasicMaterial({ color, depthTest: false, depthWrite: false, transparent: true, opacity });
 
 // Issue and probe markers keep a fixed size on screen (CSS px) in every pane, whatever the scene
@@ -156,45 +157,60 @@ export class IssueMarkers extends Layer {
   }
 }
 
-/** Probe trajectories over the whole study plus a dot at the current frame. */
+/**
+ * Probe trajectories over the whole study plus a dot at the current frame. A section's `clip`
+ * planes cut them like the parts, so a section view shows no paths of parts it has removed.
+ */
 export class ProbePaths extends Layer {
-  set(probes, frame, { offsetOf, partOf, size, visible }) {
+  set(probes, frame, { offsetOf, partOf, size, visible, clip = [] }) {
     this.clear();
     if (!visible) return;
     probes.forEach(({ name, pts }, i) => {
-      const color = new Color(PROBE_COLORS[i % PROBE_COLORS.length]);
+      const hex = PROBE_COLORS[i % PROBE_COLORS.length];
+      const color = srgb(hex);
       const off = offsetOf(partOf(name));
       const points = pts.map(p => new Vector3(...p).add(off));
       const line = new Line(new BufferGeometry().setFromPoints(points),
-        new LineBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false }));
+        new LineBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false, clippingPlanes: clip }));
       line.renderOrder = 8;
       this.group.add(line);
       const f = frame === null ? 0 : frame;
       const at = dot(points[Math.min(f, points.length - 1)], color, MARKER_PX, 0.9);
+      at.material.clippingPlanes = clip;
       at.renderOrder = 9;
       this.group.add(at);
-      this.label(at.position, 'probe', name).el.style.setProperty('--c', color.getStyle());
+      if (clip.every(pl => pl.distanceToPoint(at.position) >= 0)) {
+        this.label(at.position, 'probe', name).el.style.setProperty('--c', new Color(hex).getStyle());
+      }
     });
   }
 }
 
-/** Joint axes at the current pose: revolute = arrow + ring, prismatic = double arrow. */
+/**
+ * Joint axes at the current pose: revolute = arrow + ring, prismatic = double arrow. A ball()
+ * joint is three revolutes chained through virtual knuckle bodies that the scene does not carry
+ * (no mesh, no transforms), so their axes would sit at the home pose: those joints are skipped and
+ * the ball is drawn instead — three rings around its center, which moves with the ball's parent.
+ */
 export class JointAxes extends Layer {
-  set(joints, { transformOf, offsetOf, size, visible }) {
+  set(joints, { transformOf, offsetOf, size, visible, balls = [], isPart = () => true }) {
     this.clear();
     if (!visible) return;
     const len = size * 0.22;
     for (const j of joints) {
       if (j.kind === 'fixed') continue;
+      if (!isPart(j.parent) || !isPart(j.child)) continue; // a ball()'s revolute: drawn as its ball below
       const T = transformOf(j.parent);
       const origin = new Vector3(...j.origin).applyMatrix4(T).add(offsetOf(j.parent));
       const dir = new Vector3(...j.axis).transformDirection(T).normalize();
       const revolute = j.kind === 'revolute';
-      const color = revolute ? 0xffcc33 : 0xc792ea;
+      const color = srgb(revolute ? 0xffcc33 : 0xc792ea);
       const start = origin.clone().addScaledVector(dir, revolute ? -len * 0.35 : 0);
-      const arrow = new ArrowHelper(dir, start, revolute ? len * 1.35 : len, color, len * 0.18, len * 0.09);
+      const arrow = new ArrowHelper(dir, start, revolute ? len * 1.35 : len, 0xffffff, len * 0.18, len * 0.09);
+      arrow.setColor(color);
       if (!revolute) {
-        const back = new ArrowHelper(dir.clone().negate(), origin, len, color, len * 0.18, len * 0.09);
+        const back = new ArrowHelper(dir.clone().negate(), origin, len, 0xffffff, len * 0.18, len * 0.09);
+        back.setColor(color);
         this.group.add(back);
       }
       this.group.add(arrow);
@@ -206,6 +222,20 @@ export class JointAxes extends Layer {
       }
       this.label(origin.clone().addScaledVector(dir, revolute ? len : len * 1.05), 'joint', j.name);
     }
+    for (const b of balls) {
+      if (!isPart(b.parent)) continue;
+      const T = transformOf(b.parent);
+      const center = new Vector3(...b.center).applyMatrix4(T).add(offsetOf(b.parent));
+      const color = srgb(0xffcc33);
+      const rot = new Quaternion().setFromRotationMatrix(new Matrix4().extractRotation(T));
+      for (const n of [new Vector3(1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, 0, 1)]) {
+        const ring = new Mesh(new TorusGeometry(len * 0.16, len * 0.012, 8, 40), new MeshBasicMaterial({ color }));
+        ring.position.copy(center);
+        ring.quaternion.setFromUnitVectors(new Vector3(0, 0, 1), n.applyQuaternion(rot));
+        this.group.add(ring);
+      }
+      this.label(center.clone().add(new Vector3(0, 0, len * 0.3)), 'joint', b.name);
+    }
     this.group.traverse(o => {
       if (o.material) Object.assign(o.material, { depthTest: false, transparent: true });
       // ArrowHelper shares one line/cone geometry across instances: never dispose it.
@@ -215,19 +245,26 @@ export class JointAxes extends Layer {
   }
 }
 
-/** Faint quad + outline where the section plane cuts the model bounds. */
+/**
+ * Faint quad + thin outline where the section plane cuts the parts: `box` is the extent of the
+ * cut at the current pose (MechApp._sectionBox), never the motion envelope, so the quad hugs the
+ * cut faces instead of dwarfing the model; the caps themselves carry the cut.
+ */
 export class SectionPlane extends Layer {
-  set(section, bounds) {
+  set(section, box) {
     this.clear();
-    if (!section) return;
-    const size = bounds.getSize(new Vector3()).multiplyScalar(1.15);
-    const c = bounds.getCenter(new Vector3());
+    if (!section || box.isEmpty()) return;
+    const size = box.getSize(new Vector3());
+    const pad = size.length() * 0.025;
+    size.multiplyScalar(1.02).addScalar(pad);
+    const c = box.getCenter(new Vector3());
     const dims = { x: [size.y, size.z], y: [size.x, size.z], z: [size.x, size.y] }[section.axis];
     const geom = new PlaneGeometry(dims[0], dims[1]);
+    const tint = srgb(0x8ab4ff);
     const plane = new Mesh(geom, new MeshBasicMaterial({
-      color: 0x8ab4ff, transparent: true, opacity: 0.06, side: DoubleSide, depthWrite: false,
+      color: tint, transparent: true, opacity: 0.03, side: DoubleSide, depthWrite: false,
     }));
-    const outline = new LineSegments(new EdgesGeometry(geom), new LineBasicMaterial({ color: 0x8ab4ff, transparent: true, opacity: 0.45 }));
+    const outline = new LineSegments(new EdgesGeometry(geom), new LineBasicMaterial({ color: tint, transparent: true, opacity: 0.22 }));
     const g = new Group();
     g.add(plane, outline);
     g.position.copy(c);

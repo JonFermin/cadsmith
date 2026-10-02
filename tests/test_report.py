@@ -193,7 +193,8 @@ def test_budget_drops_bottom_of_each_tier_and_tallies():
 
 
 def test_budget_keeps_first_fail_warn_and_target_miss():
-    issues = ([_issue("FAIL", "interference", f"a{k}/b{k} overlap", parts=(f"a{k}", f"b{k}")) for k in range(30)]
+    issues = ([_issue("FAIL", "interference", f"a{k}/b{k} overlap", parts=(f"a{k}", f"b{k}"), value=30.0 - k)
+               for k in range(30)]  # (distinct volumes: alike findings would fold into one line)
               + [_issue("FAIL", "target_miss", "swing: span:j 1.00 < min 2", parts=())]
               + [_issue("WARN", "tight_clearance", "c/d gap", parts=("c", "d"))]
               + [_issue("INFO", "gear_mesh", "g1/g2 meshing", parts=("g1", "g2"))])
@@ -354,7 +355,7 @@ def test_check_report_lists_roles_mobility_and_home_clearance(four_bar):
     assert rep["status"] == "PASS" and rep["mobility"] == {"turn": 0} and rep["studies"] == []
     text = format_check(rep)
     assert text.splitlines()[0].startswith("mech check four_bar — PASS   4 parts · 3 joints")
-    assert "roles j_crank driver · j_coupler passive · j_rocker passive" in text
+    assert "roles driver j_crank · passive j_coupler, j_rocker" in text
     assert "studies turn mobility 0" in text
     assert "home min clearance" in text
 
@@ -623,3 +624,426 @@ def test_allowed_overlap_deeper_than_max_depth_says_how_to_fix_it(tmp_path):
     assert home["home_min_clearance"]["parts"] == ["rod", "bush"]
     assert home["home_min_clearance"]["value"] == pytest.approx(-0.04975, abs=1e-4)
     assert f"home min clearance {M}0.0498 mm (rod/bush; negative = overlap depth)" in format_check(home)
+
+
+# ------------------------------------------------------------------------------ compaction (big models)
+
+
+def _big_report(findings: bool = True) -> dict:
+    """A strandbeest-sized synthetic report: 2 drivers, 30 passive + 5 coupled joints, 18 loops, 7 probes
+    (six identical feet), 6 meshing pairs, 5 allowed contacts, reflected and round-off loads, 12
+    targets (callables among them) and a busy Δprev; with ``findings`` also FAIL/WARN/target_miss
+    issues in two studies (a missed callable target among them)."""
+    passive = [f"jP_{side}{k}" for k in range(15) for side in "LR"]
+    coupled = ["j_out", "j_c0", "j_c1", "j_c2", "j_c3"]
+    roles = {"j_crank": "driver", "j_lift": "driver", "j_yaw": "driver", **{j: "passive" for j in passive},
+             **{j: "coupled" for j in coupled}, "fix_a": "fixed"}
+    kinds = {j: "revolute" for j in roles} | {"j_lift": "prismatic", "fix_a": "fixed"}
+    feet = {f"foot_{side}{k}": {"min": [-30.0, 5.0, -10.0], "max": [37.8, 5.0, 12.5], "start": [0, 0, 0],
+                                "end": [0, 0, 0], "path_mm": 149.2} for k in range(3) for side in "LR"}
+    probes = {**feet, "tip": {"min": [0.0, 0.0, 0.0], "max": [10.0, 20.0, 30.0], "start": [0, 0, 0], "end": [0, 0, 0],
+                              "path_mm": 61.0}}
+
+    def ranges(scale: float) -> dict:
+        r = {"j_crank": [0.0, 360.0], "j_lift": [0.0, 40.0 * scale], "j_yaw": [0.0, 90.0],
+             "j_out": [0.0, 120.0 * scale], **{j: [-0.5 * k, 40.0 + 1.5 * k] for k, j in enumerate(passive)},
+             **{f"j_c{k}": [-38.4, 0.0] for k in range(4)}}
+        return r
+
+    def load(mx, frame, cap=None, refl=None, unit="N·m"):
+        return {"unit": unit, "max_abs": mx, "frame": frame, "capacity": cap,
+                "sf": cap / mx if cap and mx else None, "reflected_from": refl}
+
+    loads = {"j_crank": load(0.148, 3, 0.4), "j_lift": load(46.4, 0, 80.0, unit="N"), "j_yaw": load(3.42e-17, 7, 0.2),
+             "j_out": load(3.70, 3, None, "j_crank"), "j_c0": load(1.39, 3, None, "j_crank"),
+             "j_c1": load(0.741, 3, None, "j_crank"), "j_c2": load(0.278, 3, None, "j_crank"),
+             "j_c3": load(0.0, 0, None, "j_crank")}
+    walk = {"name": "walk", "frames": 73, "joint_ranges": ranges(1.0), "probes": probes,
+            "min_clearance": {"parts": ["c_L0", "upper_L0"], "value": 0.8, "frame": 23,
+                              "at": {"j_crank": 138.0, "j_out": 46.0, "j_c0": -14.7}},
+            "loads": loads, "max_residual": 1.28e-13,
+            "sweep_stats": {"seconds": 96.2, "pairs": 1521, "proximity": 900, "exact": 312, "booleans": 40,
+                            "subframe_poses": 12, "slowest": [["c_L0", "upper_L0", 3.1], ["a", "b", 2.0],
+                                                              ["c", "d", 1.5], ["e", "f", 1.0]]}}
+    lift = {**walk, "name": "lift", "frames": 21, "joint_ranges": ranges(0.5), "min_clearance": None,
+            "loads": {k: dict(v) for k, v in loads.items()}, "sweep_stats": None}
+    bad = [
+        _issue("FAIL", "interference", "c_L0/upper_L0 118 mm³ overlap 5.00×6.00×5.00 mm @ c_L0 (12.0, 3.0, 4.0), "
+               "upper_L0 (14.0, 3.0, 4.0) · f78 j_crank=272°, j_lift=12.5 mm (3 frames f76–f78)", study="walk",
+               parts=("c_L0", "upper_L0"), value=118.0),
+        _issue("FAIL", "interference", "c_L0/upper_L0 40.1 mm³ overlap", study="lift", parts=("c_L0", "upper_L0"),
+               value=40.1),
+        _issue("FAIL", "interference", "foot_L1/shin_L1 2.00 mm³ overlap 1.00×2.00×1.00 mm @ (4.0, 1.0, 2.0) · f12 "
+               "j_crank=59.2°", study="walk", parts=("foot_L1", "shin_L1"), value=2.0),
+        _issue("FAIL", "target_miss", "flat stance: 0.812 < min 0.85 (margin −0.0380)", study=None, parts=(),
+               value=0.812),
+        *[_issue("WARN", "tight_clearance", f"p{k}/q{k} gap 0.{k + 1}0 mm < 0.3 @ (1.0, 2.0, 3.0) dir (0, 0, 1) · f5 "
+                 f"j_crank=24.7°", study="walk", parts=(f"p{k}", f"q{k}"), value=0.1 * (k + 1)) for k in range(3)],
+        _issue("WARN", "joint_limit", "jP_L3 52.1° > 45 limit @ j_crank=80.0° (f16; 3 frame(s) f15–f17)",
+               study="walk", parts=("upper_L3",), value=7.1),
+    ]
+    infos = [
+        *[_issue("INFO", "gear_mesh", f"planet{k}/sun meshing: contact allowed, interference still checked",
+                 study=None, parts=(f"planet{k}", "sun"), value=None, frame=None) for k in range(6)],
+        *[_issue("INFO", "contact", f"rod{k}/bush{k} mean depth 0.0{9 - k}0 mm, 7.90 mm³ @f0 (allowed ≤ 0.1 mm)",
+                 study="walk", parts=(f"rod{k}", f"bush{k}"), value=0.01 * (9 - k), frame=0) for k in range(5)],
+        _issue("INFO", "held_at_home", "j_tail 0° — not driven by any study", study=None, parts=("tail",),
+               value=None, frame=None),
+    ]
+    issues = (bad if findings else []) + infos
+    targets = [
+        {"label": "stride", "metric": "delta:foot_L0.x", "value": 67.8, "min": 60.0, "max": None, "met": True},
+        {"label": "step lift", "metric": "delta:foot_L0.z", "value": 22.5, "min": 15.0, "max": None, "met": True},
+        {"label": "flat stance", "metric": "callable", "value": 0.812 if findings else 0.912, "min": 0.85, "max": None,
+         "met": not findings},
+        {"label": "ratio 25:1", "metric": "callable", "value": 25.0, "min": 24.9, "max": 25.1, "met": True},
+        {"label": "feet on the ground", "metric": "callable", "value": 2.0, "min": 2.0, "max": None, "met": True},
+        {"label": "output swing", "metric": "span:j_out", "value": 120.0, "min": 100.0, "max": None, "met": True},
+        {"label": "output torque", "metric": "load:j_out", "value": 3.7, "min": 3.5, "max": None, "met": True},
+        {"label": "motor SF", "metric": "sf:j_crank", "value": 2.7, "min": 2.0, "max": None, "met": True},
+        {"label": "lift SF", "metric": "sf:j_lift", "value": 1.72, "min": 1.5, "max": None, "met": True},
+        {"label": "light", "metric": "mass_g", "value": 744.0, "min": None, "max": 800.0, "met": True},
+        {"label": "lift travel", "metric": "span:j_lift", "value": 40.0, "min": 35.0, "max": None, "met": True},
+        {"label": "no collision", "metric": "clearance", "value": 0.8, "min": 0.5, "max": None, "met": True},
+    ]
+    for t in targets:
+        t.update({"severity": "FAIL", "study": None, "worst_study": "walk", "error": None,
+                  "margin": None if t["value"] is None else t["value"] - (t["min"] or 0)})
+    delta = {"params": {"crank": [15.0, 16.0], "leg": [50.0, 52.0]}, "min_clearance": [1.1, 0.8],
+             "mass_g": [731.0, 744.0],
+             "targets": {"stride": [66.1, 67.8], "step lift": [22.1, 22.5],
+                         "flat stance": [0.9, 0.812 if findings else 0.912],
+                         "output swing": [118.0, 120.0], "motor SF": [2.8, 2.7], "lift SF": [1.8, 1.72]}}
+    if findings:
+        delta = {"status": ["PASS", "FAIL"],
+                 "new": ["interference c_L0/upper_L0", "interference foot_L1/shin_L1", "tight p0/q0", "tight p1/q1",
+                         "tight p2/q2"], "fixed": ["joint_limit jP_R7"], **delta}
+    return _report(name="walker", status="FAIL" if findings else "PASS", parts=57, pins=[f"p{k}" for k in range(18)],
+                   joints={"driver": 3, "coupled": 5, "passive": 30, "free": 0, "fixed": 1}, roles=roles,
+                   joint_kinds=kinds, mobility={"walk": 0, "lift": 0}, studies=[walk, lift], issues=issues,
+                   targets=targets, mass={"total_g": 744.0, "com_mm": [0.1, 53.2, 4.3], "parts": {}},
+                   clearance={"required": 0.5, "pairs_checked": 1521, "allowed_contact": 11},
+                   viewer_url="http://localhost:3000/mech.html?m=walker&" + ("issue=0&ui=0" if findings else
+                                                                             "ghost=6&layout=quad&ui=0"),
+                   delta_prev=delta)
+
+
+GOLDEN_BIG_PASS = [
+    ('mech walker — PASS   57 parts · 39 joints (3 driver, 5 coupled, 30 passive, 1 fixed) · 18 loops · '
+     '744 g · CoG (0.1, 53.2, 4.3)'),
+    ('INFO gear_mesh 6 meshing pairs (planet0/sun, planet1/sun, planet2/sun, +3): contact allowed, '
+     'interference still checked'),
+    ('INFO contact rod0/bush0 mean depth 0.090 mm, 7.90 mm³ @f0 (allowed ≤ 0.1 mm) [walk] · 5 '
+     'allowed-contact pairs touch (+4 more — --verbose)'),
+    'INFO held_at_home j_tail 0° — not driven by any study',
+    'OK   18 loops closed (max 1.28e-13 mm) · no branch jumps · mobility 0',
+    ('clearance min 0.800 mm (c_L0/upper_L0 @f23 j_crank=138° [walk]) · required 0.5 · 1521 pairs checked '
+     '· 11 allowed-contact pairs'),
+    'load j_crank max 0.148 N·m @f3 (walk) · capacity 0.4 → SF 2.70',
+    'load j_lift max 46.4 N @f0 (walk) · capacity 80 → SF 1.72',
+    'load j_out max 3.70 N·m @f3 (walk) (reflected from j_crank) · no actuator capacity',
+    'no gravity load on j_yaw (axis ∥ g or balanced)',
+    'reflected loads j_c0 1.39 N·m, j_c1 0.741 N·m, j_c2 0.278 N·m',
+    ('targets 12/12 · stride delta:foot_L0.x 67.8 ≥ 60 · step lift delta:foot_L0.z 22.5 ≥ 15 · flat stance '
+     '0.912 ≥ 0.85 · ratio 25:1 24.9 ≤ 25.0 ≤ 25.1 · feet on the ground 2.00 ≥ 2 · output swing span:j_out '
+     '120 ≥ 100 · (+6 met — --verbose)'),
+    ('ranges j_crank 0…360° · j_lift 0…40.0 mm · j_yaw 0…90.0° · j_out 0…120° · probes '
+     'foot_L0…foot_R2 Δ(67.8, 0, 22.5) path 149 mm ×6 · probe tip Δ(10.0, 20.0, 30.0) path 61.0 mm · '
+     '(+34: 30 passive, 4 '
+     'coupled — --verbose)'),
+    ('Δprev: params crank 15→16, leg 50→52 · min clearance 1.10→0.800 mm · mass 731→744 g · stride '
+     '66.1→67.8 · step lift 22.1→22.5 · flat stance 0.900→0.912 · output swing 118→120 · motor SF '
+     '2.80→2.70 · lift SF 1.80→1.72'),
+    ('view http://localhost:3000/mech.html?m=walker&ghost=6&layout=quad&ui=0 · shot: uv run mech shot '
+     'walker'),
+]
+GOLDEN_BIG_FAIL = [
+    ('mech walker — FAIL   57 parts · 39 joints (3 driver, 5 coupled, 30 passive, 1 fixed) · 18 loops · '
+     '744 g · CoG (0.1, 53.2, 4.3)'),
+    ('FAIL interference c_L0/upper_L0 118 mm³ overlap 5.00×6.00×5.00 mm @ c_L0 (12.0, 3.0, 4.0), upper_L0 '
+     '(14.0, 3.0, 4.0) · f78 j_crank=272°, j_lift=12.5 mm (3 frames f76–f78) [walk, lift]'),
+    ('FAIL interference foot_L1/shin_L1 2.00 mm³ overlap 1.00×2.00×1.00 mm @ (4.0, 1.0, 2.0) · f12 '
+     'j_crank=59.2° [walk]'),
+    'FAIL target_miss flat stance: 0.812 < min 0.85 (margin −0.0380)',
+    'WARN tight p0/q0 gap 0.10 mm < 0.3 @ (1.0, 2.0, 3.0) dir (0, 0, 1) · f5 j_crank=24.7° [walk]',
+    'WARN tight p1/q1 gap 0.20 mm < 0.3 @ (1.0, 2.0, 3.0) dir (0, 0, 1) · f5 j_crank=24.7° [walk]',
+    'WARN tight p2/q2 gap 0.30 mm < 0.3 @ (1.0, 2.0, 3.0) dir (0, 0, 1) · f5 j_crank=24.7° [walk]',
+    'WARN joint_limit jP_L3 52.1° > 45 limit @ j_crank=80.0° (f16; 3 frame(s) f15–f17) [walk]',
+    'OK   18 loops closed (max 1.28e-13 mm) · no branch jumps · mobility 0',
+    ('clearance min 0.800 mm (c_L0/upper_L0 @f23 j_crank=138° [walk]) · required 0.5 · 1521 pairs checked '
+     '· 11 allowed-contact pairs'),
+    'load j_crank max 0.148 N·m @f3 (walk) · capacity 0.4 → SF 2.70',
+    ('targets 11/12 · stride delta:foot_L0.x 67.8 ≥ 60 · step lift delta:foot_L0.z 22.5 ≥ 15 · ratio 25:1 '
+     '24.9 ≤ 25.0 ≤ 25.1 · feet on the ground 2.00 ≥ 2 · output swing span:j_out 120 ≥ 100 · output torque '
+     'load:j_out 3.70 ≥ 3.5 · (+5 met — --verbose)'),
+    ('Δprev: status PASS→FAIL · params crank 15→16, leg 50→52 · fixed joint_limit jP_R7 · new interference '
+     'c_L0/upper_L0, interference foot_L1/shin_L1, tight p0/q0 (+2 more — --verbose) · min clearance '
+     '1.10→0.800 mm · mass 731→744 g · (+6 more — --verbose)'),
+    '(+8 more: 3 INFO, 4 load, 1 ranges — --verbose)',
+    'view http://localhost:3000/mech.html?m=walker&issue=0&ui=0 · shot: uv run mech shot walker',
+]
+
+
+def test_big_summary_folds_every_repetitive_kind():
+    """The ≤ 15-line summary of a strandbeest-sized model fits ≤ 250 characters a line: loops counted,
+    the clearance pose by its driver, rated loads and the targeted reflected load on their own lines
+    with the other reflected loads folded and the round-off load folded as zero, gear meshes and
+    contacts folded, identical probes collapsed, passive/coupled ranges counted, callables by
+    their label. --verbose unfolds all of it."""
+    from mech.report import SUMMARY_WIDTH
+
+    lines = format_summary(_big_report(findings=False)).splitlines()
+    assert lines == GOLDEN_BIG_PASS
+    assert len(lines) == SUMMARY_LINES and max(map(len, lines)) <= SUMMARY_WIDTH
+    verbose = format_summary(_big_report(findings=False), verbose=True).splitlines()
+    assert not any(line.startswith("(+") or "--verbose" in line for line in verbose)
+    assert sum(line.startswith("INFO gear_mesh planet") for line in verbose) == 6
+    assert sum(line.startswith("INFO contact rod") for line in verbose) == 5
+    assert "load j_c0 max 1.39 N·m @f3 (walk) (reflected from j_crank) · no actuator capacity" in verbose
+    assert "no gravity load on j_yaw (axis ∥ g or balanced)" in verbose  # round-off is zero in verbose too
+    assert verbose[next(i for i, line in enumerate(verbose) if line.startswith("OK "))].startswith(
+        "OK   loops p0, p1, p2, p3, ")
+    ranges = next(line for line in verbose if line.startswith("ranges"))
+    assert f"jP_R14 {M}14.5…83.5°" in ranges and "probe foot_R2 Δ(67.8, 0, 22.5) path 149 mm" in ranges
+    assert [line for line in verbose if line.startswith("sweep ")] == [
+        "sweep walk 96.2 s · 1521 pairs · 900 proximity · 312 exact · 40 booleans · 12 sub-frame poses · slowest "
+        "c_L0/upper_L0 3.10 s, a/b 2.00 s, c/d 1.50 s"]
+
+
+def test_big_summary_keeps_every_finding_first():
+    """With FAIL/WARN/target_miss findings the budget goes to them and the context lines (loops,
+    clearance, targets, Δprev); what does not fit is tallied by kind."""
+    from mech.report import SUMMARY_WIDTH
+
+    lines = format_summary(_big_report(findings=True)).splitlines()
+    assert lines == GOLDEN_BIG_FAIL
+    assert len(lines) == SUMMARY_LINES and max(map(len, lines)) <= SUMMARY_WIDTH
+    report = _big_report(findings=True)
+    findings = [i for i in report["issues"] if i["severity"] != "INFO"]
+    shown = [line for line in lines if line[:4] in ("FAIL", "WARN")]
+    assert len(shown) == len(findings) - 1  # the two c_L0/upper_L0 interferences are one finding
+    assert "<lambda>" not in "\n".join(lines) and "callable" not in "\n".join(lines)
+
+
+def test_a_finding_wider_than_the_cap_is_never_cut():
+    """A FAIL line keeps its whole message (it is the fix); a long study list shortens instead."""
+    from mech.report import SUMMARY_WIDTH
+
+    msg = ("arm/post 5.00 mm³ overlap 1.00×5.00×1.00 mm @ arm (12.0, 3.0, 4.0), post (14.0, 3.0, 4.0) · f78 "
+           + ", ".join(f"j_drive{k}={k}0.0°" for k in range(12)) + " — meshing pair: check center distance/backlash")
+    studies = [_study(n) for n in ("walk", "trot", "gallop", "turn")]
+    issues = [_issue("FAIL", "interference", msg, study=s["name"], parts=("arm", "post")) for s in studies]
+    lines = format_summary(_report(status="FAIL", issues=issues, studies=studies,
+                                   mobility={s["name"]: 0 for s in studies})).splitlines()
+    assert lines[1] == f"FAIL interference {msg} [walk +3]" and len(lines[1]) > SUMMARY_WIDTH
+    assert all(len(line) <= SUMMARY_WIDTH for i, line in enumerate(lines) if i != 1)
+    assert format_summary(_report(status="FAIL", issues=issues[:1])).splitlines()[1] == f"FAIL interference {msg}"
+
+
+def test_view_line_never_cuts_the_shot_command():
+    """An export outside <repo>/output names the --output-dir in the shot command, whole, however long
+    the path: the prose around it shortens to keep the line within the width while it can."""
+    from mech.report import SUMMARY_WIDTH
+
+    for n, prose in ((20, "view: exported to C:\\"), (120, "view: exported outside <repo>/output (not served by "
+                                                                "the viewer) · "),
+                     (170, "view: not served · "), (300, "view: not served · ")):
+        out_dir = "C:\\" + "d" * n
+        view = format_summary(_report(out_dir=out_dir)).splitlines()[-1]
+        assert view.endswith(f" · shot: uv run mech shot four_bar --output-dir {out_dir}"), view
+        assert view.startswith(prose) and (len(view) <= SUMMARY_WIDTH) == (n < 300)
+    assert format_summary(_report(out_dir="C:\\x")).splitlines()[-1] == (
+        "view: exported to C:\\x (the viewer serves <repo>/output only) · shot: uv run mech shot four_bar "
+        "--output-dir C:\\x")
+
+
+def test_invalid_summary_shows_every_error_and_counts_the_rest():
+    """Every model error is its own line, even five about one joint; past the budget the rest are
+    counted with the --verbose hint."""
+    five = invalid_report("arm", [f"revolute 'j_arm': problem {k}" for k in range(5)], {})
+    lines = format_summary(five).splitlines()
+    assert lines[0] == "mech arm — INVALID   5 errors" and len(lines) == 7
+    assert lines[1:6] == [f"FAIL invalid_model revolute 'j_arm': problem {k}" for k in range(5)]
+    twenty = invalid_report("arm", [f"revolute 'j_{k}': unknown parent part 'x'" for k in range(20)], {})
+    lines = format_summary(twenty).splitlines()
+    assert len(lines) == SUMMARY_LINES and lines[0] == "mech arm — INVALID   20 errors"
+    assert sum(line.startswith("FAIL invalid_model") for line in lines) == 12
+    assert lines[-2:] == ["(+8 more: 8 FAIL invalid_model — --verbose)",
+                          "nothing analyzed — fix the errors above and re-run"]
+    assert len(format_summary(twenty, verbose=True).splitlines()) == 22
+
+
+def test_callable_targets_are_shown_by_their_label(tmp_path):
+    """A callable target reads as its label in the targets line and in a miss — never ``<lambda>()``
+    or a function name — and report.json records its metric as "callable"."""
+    asm = make_four_bar()
+    asm.target("half the mass", lambda r: r["mass"]["total_g"] / 2, min=1.0)
+
+    def rocker_ratio(r):
+        return 0.5
+
+    asm.target("ratio", rocker_ratio, min=1.0)
+    rep = analyze(asm, export=False, out_root=tmp_path)
+    assert [t["metric"] for t in rep["targets"]] == ["span:j_rocker", "callable", "callable"]
+    text = format_summary(rep)
+    assert "half the mass 21.2 ≥ 1" in text and f"FAIL target_miss ratio: 0.500 < min 1 (margin {M}0.500)" in text
+    assert "<lambda>" not in json.dumps(rep, ensure_ascii=False) and "rocker_ratio" not in text
+
+
+def test_round_off_loads_are_zero():
+    """A holding load at round-off level (gravity along the axis: 3.4e-17 N·m beside a 0.15 N·m
+    actuator) is stored as exactly 0 and folds into the no-gravity line; its SF is unbounded."""
+    from mech.report import _load_entries
+    from mech.targets import is_zero_load, load_scale
+
+    loads = {"turn": {"j_crank": {"unit": "N·m", "max_abs": 0.148, "frame": 3},
+                      "j_yaw": {"unit": "N·m", "max_abs": 3.42e-17, "frame": 7},
+                      "j_swing": {"unit": "N·m", "max_abs": 1.07e-14, "frame": 2}}}
+    scale = load_scale(loads)
+    assert scale == 0.148 and is_zero_load(1.07e-14, scale) and not is_zero_load(1e-6, scale)
+    assert is_zero_load(1e-12, 0.0) and not is_zero_load(None, scale)  # an absolute floor when all are tiny
+
+    class _Asm:  # what _load_entries reads
+        actuators = {"j_crank": type("A", (), {"capacity": 0.4})(), "j_yaw": type("A", (), {"capacity": 0.2})()}
+
+    entries = _load_entries(_Asm(), loads["turn"], scale=scale)
+    assert entries["j_yaw"]["max_abs"] == 0.0 and entries["j_yaw"]["sf"] is None
+    assert entries["j_swing"]["max_abs"] == 0.0 and entries["j_crank"]["max_abs"] == 0.148
+    study = _study(load=0.148, frame=3)
+    study["loads"]["j_yaw"] = {"unit": "N·m", "max_abs": 3.42e-17, "frame": 7, "capacity": 0.2, "sf": 5.8e15,
+                               "reflected_from": None}  # an older report.json: the summary folds it too
+    lines = format_summary(_report(studies=[study])).splitlines()
+    assert "no gravity load on j_yaw (axis ∥ g or balanced)" in lines
+    assert not any("e-17" in line or "e15" in line for line in lines)
+
+
+def test_sweep_stats_are_in_the_report_and_the_verbose_summary(tmp_path):
+    from build123d import Box, Pos
+
+    from mech import Assembly
+
+    asm = Assembly("stats", clearance=0.3)
+    asm.part("base", Pos(0, 0, -3) * Box(80, 80, 4), ground=True)
+    asm.part("arm", Pos(20, 0, 2) * Box(40, 6, 4))
+    asm.revolute("j", "base", "arm", origin=(0, 0, 0), axis=(0, 0, 1))
+    asm.study("swing", drive={"j": (0, 90)}, frames=5)
+    rep = analyze(asm, export=False, out_root=tmp_path)
+    stats = rep["studies"][0]["sweep_stats"]
+    assert isinstance(stats, dict) and stats["seconds"] > 0
+    json.dumps(stats, allow_nan=False)
+    perf = [line for line in format_summary(rep, verbose=True).splitlines() if line.startswith("sweep swing ")]
+    assert len(perf) == 1 and perf[0].split(" · ")[0].endswith(" s")
+    assert not any(line.startswith("sweep ") for line in format_summary(rep).splitlines())  # --verbose only
+
+
+def test_pose_of_a_finding_names_the_coupled_joints_on_its_parts_chain(tmp_path):
+    """A driver that turns many coupled joints (a planetary's sun) is named with only the coupled
+    outputs that pose the finding's parts; the clearance line names drivers only."""
+    from build123d import Box, Pos
+
+    from mech import Assembly
+
+    asm = Assembly("coupled", clearance=0.3)
+    asm.part("base", Pos(0, 0, -3) * Box(200, 200, 4), ground=True)
+    asm.part("drive", Pos(0, 0, 5) * Box(10, 10, 4))
+    asm.revolute("j_in", "base", "drive", origin=(0, 0, 0), axis=(0, 0, 1))
+    for k, x in enumerate((-60, 60)):
+        asm.part(f"arm{k}", Pos(x + 15, 0, 5) * Box(30, 4, 4))
+        asm.revolute(f"j_arm{k}", "base", f"arm{k}", origin=(x, 0, 0), axis=(0, 0, 1))
+        asm.couple("j_in", f"j_arm{k}", ratio=1.0)
+    asm.part("block", Pos(-60, 25, 5) * Box(6, 6, 4), ground=True)  # in arm0's path at 90°
+    asm.study("turn", drive={"j_in": (0, 120)}, frames=7)
+    rep = analyze(asm, export=False, out_root=tmp_path)
+    hit = next(i for i in rep["issues"] if i["code"] == "interference")
+    assert hit["parts"] == ["arm0", "block"] or hit["parts"] == ["block", "arm0"]
+    assert "(j_arm0=" in hit["message"] and "j_arm1" not in hit["message"]
+    clear = next(line for line in format_summary(rep).splitlines() if line.startswith("clearance"))
+    assert "j_in=" in clear and "j_arm" not in clear
+
+
+# ------------------------------------------------------------------------------ review round 3
+
+
+def test_alike_pair_findings_fold_into_one_line():
+    """strandbeest -p gap=0.2: mirrored pairs all tight at the same gap over the same frames are
+    one finding — one line naming the worst in full and the others after it — so the load and
+    ranges lines keep their room. Different gaps stay apart; --verbose lists every pair."""
+    span = "(61 frames f0–f60)"
+    alike = [_issue("WARN", "tight_clearance", f"{a}/{b} gap 0.200 mm < 0.5 @ (0, 0, 0) · f{k} j_crank=0° {span}",
+                    parts=(a, b), value=0.2 + k * 1e-6, frame=k)
+             for k, (a, b) in enumerate([("c_R2", "upper_R2"), ("c_L0", "upper_L0"), ("k_L0", "k_R0"),
+                                         ("c_R0", "upper_R0"), ("k_L2", "k_R2")])]
+    other = _issue("WARN", "tight_clearance", f"x/y gap 0.400 mm < 0.5 @ (0, 0, 0) · f3 j_crank=0° {span}",
+                   parts=("x", "y"), value=0.4)
+    rep = _report(status="WARN", issues=alike + [other])
+    lines = format_summary(rep).splitlines()
+    warn = [line for line in lines if line.startswith("WARN")]
+    assert warn == [f"WARN tight 5 pairs alike: {alike[0]['message']} · also c_L0/upper_L0, k_L0/k_R0 "
+                    f"(+2 more — --verbose)", f"WARN tight {other['message']}"]
+    assert any(line.startswith("load j_crank") for line in lines) and any(line.startswith("ranges") for line in lines)
+    assert len([line for line in format_summary(rep, verbose=True).splitlines() if line.startswith("WARN")]) == 6
+    assert len([line for line in format_check(rep).splitlines() if line.startswith("WARN")]) == 2
+
+
+def test_delta_prev_never_says_no_change_over_findings_it_left_out():
+    """A --frames run FAILs where the full run passed: the studies are sampled differently, so the
+    issue is not compared — and the Δprev line says so instead of "no change"."""
+    from mech.report import _delta_prev, _format_delta
+
+    prev = _report(status="PASS", delta_prev=None)
+    now = _report(status="FAIL", studies=[dict(_study(), frames=5)],
+                  issues=[_issue("FAIL", "interference", "crank/rocker 3.00 mm³ overlap", value=3.0)])
+    d = _delta_prev(now, prev)
+    assert d["not_compared_issues"] == {"FAIL": 1} and "status" not in d
+    assert _format_delta(d) == "Δprev: no change in the shared scope (not compared: 1 FAIL, turn (72→5 frames))"
+    d = _delta_prev(_report(studies=[dict(_study(), frames=5)]), prev)
+    assert "not_compared_issues" not in d and _format_delta(d) == "Δprev: no change (not compared: turn (72→5 frames))"
+
+
+def test_unresolved_intervals_are_an_info_line_and_a_verbose_stat():
+    """The sweep's sub_unresolved count surfaces: an INFO naming the pairs (the frames alone vouch
+    for those intervals) and `· N unresolved` on the --verbose sweep line."""
+    from types import SimpleNamespace
+
+    from mech.report import _perf_lines, _unresolved_issues
+
+    stats = {"seconds": 0.3, "pairs": 3, "sub_unresolved": 8, "unresolved_pairs": [["lid_left", "lid_right", 8]]}
+    (issue,) = _unresolved_issues(SimpleNamespace(name="open"), SimpleNamespace(stats=stats))
+    assert (issue.severity, issue.code, issue.parts, issue.value) == ("INFO", "subframe_unresolved",
+                                                                      ["lid_left", "lid_right"], 8.0)
+    assert issue.message.startswith("8 between-frame intervals not proven clear (lid_left/lid_right)")
+    assert _unresolved_issues(SimpleNamespace(name="open"), SimpleNamespace(stats={"sub_unresolved": 0})) == []
+    rep = _report(studies=[dict(_study(), sweep_stats=stats)], issues=[issue.to_dict()])
+    assert any(line.startswith("INFO unresolved 8 between-frame intervals") for line in format_summary(rep).splitlines())
+    assert _perf_lines(rep)[0].text == "sweep turn 0.300 s · 3 pairs · 8 unresolved"
+
+
+def test_equality_target_prints_its_value_at_the_bounds_precision():
+    """planetary: an equality target met at −0.333333 must not read `−0.333333 ≤ −0.333 ≤ −0.333333`."""
+    def target(label, value, lo, hi):
+        return {"label": label, "metric": "callable", "value": value, "min": lo, "max": hi, "met": True,
+                "severity": "FAIL", "study": None, "worst_study": None, "error": None}
+
+    rep = _report(targets=[target("ratio 25:1", 25.0, 25.0, 25.0), target("planet spin", -0.333333, -0.333333,
+                                                                                -0.333333),
+                           target("band", 44.0, 43.12, 44.88)])
+    line = next(line for line in format_summary(rep).splitlines() if line.startswith("targets"))
+    assert line == f"targets 3/3 · ratio 25:1 25.0 = 25 · planet spin {M}0.333333 = {M}0.333333 · band 43.12 ≤ 44.0 ≤ 44.88"
+
+
+def test_check_roles_line_names_drivers_first_and_counts_the_rest():
+    """desktop_arm: 36 joints — the drivers and coupled joints by name, the passive and fixed
+    joints counted, never 8 fixed joints shown while 3 of 4 drivers hide behind '+N more'."""
+    roles = {f"fix_{k}": "fixed" for k in range(8)}
+    roles |= {"j_yaw": "coupled", "j_yaw_motor": "driver", **{f"fix_more_{k}": "fixed" for k in range(15)},
+              "j_shoulder_motor": "driver", "j_elbow_motor": "driver", "j_roll": "driver", "j_shoulder": "coupled",
+              "j_elbow": "coupled", **{f"j_passive_{k}": "passive" for k in range(6)}}
+    text = format_check(_report(roles=roles, joints={"driver": 4, "coupled": 3, "passive": 6, "free": 0, "fixed": 23}))
+    (line,) = [line for line in text.splitlines() if line.startswith("roles")]
+    assert line == ("roles driver j_yaw_motor, j_shoulder_motor, j_elbow_motor, j_roll · coupled j_yaw, j_shoulder, "
+                    "j_elbow · (+29: 6 passive, 23 fixed — --verbose)")
+    full = format_check(_report(roles=roles), verbose=True)
+    assert "passive j_passive_0, j_passive_1" in full and "fixed fix_0, fix_1" in full
+    assert text.splitlines()[-1] == "next: `uv run mech run` the same script to run the studies"
+    assert format_check(_report(), command="uv run mech run x.py").splitlines()[-1] == \
+        "next: uv run mech run x.py to run the studies"

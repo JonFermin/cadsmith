@@ -2,10 +2,14 @@
 import { Box3, Plane, Vector3 } from 'three';
 import { PartSet } from './parts.js';
 import { IssueMarkers, JointAxes, ProbePaths, SectionPlane } from './overlays.js';
-import { camDirection, viewDirection } from './viewer.js';
+import { boxCorners, camDirection, viewDirection } from './viewer.js';
 
 const SECTION_KEEP = { x: -1, y: 1, z: -1 }; // default kept side faces the iso/front/top camera
 const ISSUE_STATUS = { interference: 'interference', static_interference: 'interference', tight_clearance: 'tight' };
+// By default probe paths are framed too when they stay within this fraction beyond the parts'
+// own extent; a longer sweep (a 360° arc, a lever's circle) is cropped rather than shrinking the
+// model. paths=1 always frames them, paths=0 hides them.
+const PATH_SLACK = 0.3;
 
 export class MechApp {
   /**
@@ -30,23 +34,28 @@ export class MechApp {
       frame: model.studies.length ? 0 : null, // null = home pose
       hidden: new Set(),
       isolate: new Set(),
+      focus: [], // parts the camera frames (focus= / issue=); empty = the isolate set or all visible
       issue: null,
       section: null,
       explode: 0,
       axes: false,
-      probes: true,
+      probes: true, // probe paths drawn
+      framePaths: false, // probe paths always framed (paths=1), not only when near the parts
       ghost: 0,
       layout: 'single',
       view: null,
+      zoom: 1,
       playing: false,
       speed: 1,
       time: 0,
     };
 
-    // Bounds over the home pose and every study's motion envelope: grid, lights, section range.
-    this.bounds = this.parts.envelope(null, model.partIds);
+    // Bounds over the home pose and every study's motion envelope: floor height, lights, clip
+    // ranges and the section slider range. The grid is sized to the home pose alone.
+    const home = this.parts.envelope(null, model.partIds);
+    this.bounds = home.clone();
     model.studies.forEach((_, si) => this.bounds.union(this.parts.envelope(si, model.partIds)));
-    viewer.setBounds(this.bounds);
+    viewer.setBounds(home, this.bounds);
     this.size = this.bounds.getSize(new Vector3()).length();
   }
 
@@ -94,17 +103,26 @@ export class MechApp {
     if (p.focus.length) focus = m.checkParts(p.focus, 'focus');
     s.explode = p.explode;
     s.axes = p.axes;
+    s.probes = p.paths !== false;
+    s.framePaths = p.paths === true;
     s.ghost = p.ghost;
     s.layout = p.layout;
     s.view = p.view;
-    if (p.section) this._setSection(p.section);
+    s.zoom = p.zoom;
+    s.focus = focus;
     if (s.si !== null) s.time = m.studies[s.si].t?.[s.frame ?? 0] ?? 0;
+    // Pose and visibility first: the section's default offset depends on the posed parts
+    // (_sectionOffset).
+    this.parts.setPose(s.si, s.frame, s.explode);
+    this.parts.applyStyle({ hidden: s.hidden, isolate: s.isolate, highlight: new Map(), xray: new Set(), section: false });
+    if (p.section) this._setSection(p.section);
 
     this.viewer.setLayout(s.layout);
     this.refresh({ ghosts: true });
     const dir = p.cam ? camDirection(p.cam.az, p.cam.el) : viewDirection(p.view || 'iso');
     this.viewer.setMainLabel(p.cam ? `az ${p.cam.az}° el ${p.cam.el}°` : p.view || 'iso');
-    this.fit(focus.length ? focus : null, dir);
+    // focus= / issue= frame their parts; otherwise an isolate= set, else the visible parts.
+    this.fit(this._interestIds(), dir);
   }
 
   _issueParts(iss) {
@@ -136,12 +154,14 @@ export class MechApp {
     const offsetOf = id => parts.offsetOf(id);
     this.issueMarkers.set(entries, { offsetOf, size: this.size, selected });
     this.probePaths.set(model.probes(s.si), s.frame, {
-      offsetOf, partOf: n => this.probePart.get(n), size: this.size, visible: s.probes,
+      offsetOf, partOf: n => this.probePart.get(n), size: this.size, visible: s.probes, clip: parts.clipping,
     });
     this.jointAxes.set([...model.joints.values()], {
       transformOf: id => model.transform(s.si, s.frame, id), offsetOf, size: this.size, visible: s.axes,
+      balls: model.balls, isPart: id => model.partSet.has(id),
     });
-    this.sectionPlane.set(s.section, this.bounds);
+    this.sectionPlane.set(s.section, this._sectionBox());
+    this.viewer.setShadowBox(parts.currentBox()); // the shadow frustum follows the visible parts
     this.viewer.requestRender();
     this._emit('pose');
   }
@@ -237,11 +257,11 @@ export class MechApp {
     this.setPlaying(false);
     this._selectIssue(i);
     this.refresh({ ghosts: true });
-    const parts = this._issueParts(iss);
-    this.fit(parts.length ? parts : null);
+    this.fit();
     this._emit('isolate');
   }
 
+  /** Select report issue i: its study + frame, its parts isolated and framed. */
   _selectIssue(i) {
     const s = this.state;
     const iss = this.model.issues[i];
@@ -250,10 +270,12 @@ export class MechApp {
     s.frame = iss.frame ?? null;
     const parts = this._issueParts(iss);
     s.isolate = new Set(parts);
+    s.focus = parts;
   }
 
   clearIsolate() {
     this.state.isolate = new Set();
+    this.state.focus = [];
     this.state.issue = null;
     this.refresh();
     this._emit('isolate');
@@ -261,6 +283,7 @@ export class MechApp {
 
   setIsolate(ids) {
     this.state.isolate = new Set(ids);
+    this.state.focus = [];
     this.refresh();
     this._emit('isolate');
   }
@@ -311,8 +334,7 @@ export class MechApp {
       this.parts.setClipping([]);
       return;
     }
-    const center = this.bounds.getCenter(new Vector3());
-    const offset = section.offset ?? center[section.axis];
+    const offset = section.offset ?? this._sectionOffset(section.axis);
     s.section = { axis: section.axis, offset, flip: !!section.flip };
     const sign = SECTION_KEEP[section.axis] * (section.flip ? -1 : 1);
     const normal = new Vector3();
@@ -321,31 +343,114 @@ export class MechApp {
     this.parts.setClipping([new Plane(normal, -sign * offset)]);
   }
 
+  /**
+   * Default section offset along `axis` (section=x without :offset), at the current pose:
+   *  - a selected issue shown at its own pose → through its overlap location;
+   *  - parts of interest (focus / issue / isolate) → the middle of the range they all span, so
+   *    every one of them is cut (else the centre of their box);
+   *  - otherwise the centre of the visible parts.
+   */
+  _sectionOffset(axis) {
+    const { parts, model, state: s } = this;
+    const iss = s.issue === null ? null : model.issues[s.issue];
+    const a = iss ? this._issueParts(iss)[0] : null;
+    const si = iss?.study ? model.studies.findIndex(st => st.name === iss.study) : s.si;
+    if (iss?.location && a && si === s.si && (iss.frame ?? null) === s.frame) {
+      return new Vector3(...iss.location).applyMatrix4(parts.items.get(a).mesh.matrix)[axis];
+    }
+    const ids = this._interestIds();
+    if (ids) {
+      let lo = -Infinity;
+      let hi = Infinity;
+      for (const id of ids) {
+        const b = parts.currentBox([id]);
+        if (b.isEmpty()) continue;
+        lo = Math.max(lo, b.min[axis]);
+        hi = Math.min(hi, b.max[axis]);
+      }
+      if (lo <= hi) return (lo + hi) / 2;
+    }
+    let box = parts.currentBox(ids);
+    if (box.isEmpty()) box = parts.currentBox();
+    if (box.isEmpty()) box = this.bounds;
+    return box.getCenter(new Vector3())[axis];
+  }
+
   setView(name) {
     this.state.view = name;
     this.viewer.setMainLabel(name);
-    this.fit(this._focusIds(), viewDirection(name));
+    this.fit(this._interestIds(), viewDirection(name));
   }
 
+  /** The isolated parts (the others are faint context), or null. */
   _focusIds() {
     return this.state.isolate.size ? [...this.state.isolate] : null;
   }
 
+  /** Parts the camera and section default to: focus= / issue= parts, else the isolate set, else null (all visible). */
+  _interestIds() {
+    return this.state.focus.length ? [...this.state.focus] : this._focusIds();
+  }
+
   /**
-   * Fit the camera: explicit ids → their current bbox; otherwise the visible parts' motion
-   * envelope over the current study plus their current (possibly exploded) boxes.
+   * Box the section overlay covers: where the plane crosses the (non-context) visible parts at
+   * the current pose — the extent of the cut — or, when it crosses none, those parts' box.
    */
-  fit(ids = this._focusIds(), dir = null) {
+  _sectionBox() {
     const { parts, state: s } = this;
-    let box;
+    if (!s.section) return new Box3();
+    const ids = this._focusIds();
+    const box = new Box3().setFromPoints(parts.cutPoints(ids, parts.clipping[0]));
+    return box.isEmpty() ? parts.currentBox(ids) : box;
+  }
+
+  /**
+   * World points the camera fit must enclose (MECH_SPEC §7 framing):
+   *  - explicit ids (focus=, issue=, isolate=) → those parts' hull points at the current pose;
+   *  - otherwise the visible parts at the current (possibly exploded) pose,
+   *    + the ghost poses when ghost=N is on,
+   *    + the probe paths when shown: always with paths=1, by default only when they stay within
+   *      PATH_SLACK of the parts' extent (a long sweep is cropped rather than shrinking the model).
+   * With a section on, only what is left on the kept side of the plane counts.
+   */
+  fitPoints(ids = this._interestIds()) {
+    const { parts, model, state: s } = this;
+    const plane = s.section ? parts.clipping[0] : null;
+    const pts = [];
     if (ids && ids.length) {
-      box = parts.currentBox(ids);
+      parts.hullPoints(ids, pts, plane);
+      if (!pts.length) parts.hullPoints(ids, pts); // all cut away: frame where they would be
     } else {
-      box = parts.envelope(s.si).union(parts.currentBox());
-      if (box.isEmpty()) box = this.bounds.clone();
+      parts.hullPoints(null, pts, plane);
+      if (s.ghost > 0) parts.ghostPoints(s.si, model.ghostFrames(s.si, s.ghost), s.hidden, pts, plane);
+      if (!pts.length) parts.hullPoints(null, pts);
+      if (s.probes && pts.length) {
+        const lim = new Box3().setFromPoints(pts);
+        lim.expandByVector(lim.getSize(new Vector3()).multiplyScalar(PATH_SLACK));
+        let pathPts = [];
+        for (const { name, pts: path } of model.probes(s.si)) {
+          const off = parts.offsetOf(this.probePart.get(name));
+          for (const p of path) pathPts.push(new Vector3(...p).add(off));
+        }
+        if (plane) pathPts = pathPts.filter(p => plane.distanceToPoint(p) >= 0); // cut like the parts
+        if (s.framePaths || pathPts.every(p => lim.containsPoint(p))) pts.push(...pathPts);
+      }
     }
-    if (box.isEmpty()) box = new Box3(new Vector3(-10, -10, -10), new Vector3(10, 10, 10));
-    this.viewer.setOrthoBox(box);
-    this.viewer.frame(box, dir);
+    if (!pts.length) {
+      const box = this.bounds.isEmpty() ? new Box3(new Vector3(-10, -10, -10), new Vector3(10, 10, 10)) : this.bounds;
+      return boxCorners(box);
+    }
+    return pts;
+  }
+
+  /** Fit the camera (and the quad panes) to `fitPoints(ids)`, looking along `dir` if given. */
+  fit(ids = this._interestIds(), dir = null) {
+    this.viewer.frame(this.fitPoints(ids), dir, this.state.zoom);
+  }
+
+  /** Change the zoom factor (fit-distance divisor) and refit. */
+  setZoom(zoom) {
+    this.state.zoom = Math.max(zoom, 1e-3);
+    this.fit();
   }
 }

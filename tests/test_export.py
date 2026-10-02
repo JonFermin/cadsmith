@@ -38,7 +38,7 @@ def test_four_bar_export_layout(tmp_path, four_bar):
     report = analyze(four_bar, out_root=tmp_path)
     out = tmp_path / "four_bar.mech"
     assert mech_dir(tmp_path, "four_bar") == out
-    assert sorted(p.name for p in out.iterdir()) == ["parts", "report.json", "scene.json"]
+    assert sorted(p.name for p in out.iterdir()) == ["parts", "report.json", "scene.json", "series.json"]
     assert sorted(p.name for p in (out / "parts").iterdir()) == ["coupler.stl", "crank.stl", "frame.stl",
                                                                  "rocker.stl"]
     scene = _strict_load(out / "scene.json")
@@ -168,3 +168,114 @@ def test_stl_failure_is_an_export_error_without_leftovers(tmp_path, four_bar, mo
     with pytest.raises(ex.ExportError, match=r"part 'frame' \(export_stl failed\)"):
         analyze(four_bar, out_root=tmp_path)
     assert list((mech_dir(tmp_path, "four_bar") / "parts").glob("*.stl")) == []
+
+
+# ------------------------------------------------------------------------------ series.json, CoG, virtual parts
+
+
+def test_series_json_is_the_full_precision_per_frame_record(tmp_path, four_bar):
+    """series.json holds, per study and frame, t / ok / every moving joint / probe points / loads /
+    residual at full float precision (scene.json rounds to 6 significant figures)."""
+    from mech import Kinematics
+    from mech.geom import fnum
+    from mech.motion import run_study
+    from mech.statics import gravity_loads
+    from mech.massprops import part_props
+
+    analyze(four_bar, out_root=tmp_path)
+    series = _strict_load(tmp_path / "four_bar.mech" / "series.json")
+    assert (series["version"], series["name"], series["units"], series["angles"]) == (1, "four_bar", "mm", "deg")
+    (st,) = series["studies"]
+    assert (st["name"], st["frames"], st["loop"]) == ("turn", 72, "once")
+    assert set(st) == {"name", "frames", "loop", "t", "ok", "joints", "probes", "loads", "residual"}
+
+    kin = Kinematics(four_bar)
+    res = run_study(four_bar, kin, four_bar.studies[0])
+    loads = gravity_loads(four_bar, kin, res, {n: part_props(p) for n, p in four_bar.parts.items()})
+    assert st["t"] == [float(t) for t in res.t] and st["ok"] == [True] * 72
+    assert set(st["joints"]) == {"j_crank", "j_coupler", "j_rocker"}
+    rocker = [p.q["j_rocker"] for p in res.poses]
+    assert st["joints"]["j_rocker"] == pytest.approx(rocker, rel=1e-12, abs=1e-12)
+    assert any(v != fnum(v) for v in st["joints"]["j_rocker"])  # more than 6 significant figures
+    assert st["probes"]["mid"][17] == pytest.approx(list(res.probes["mid"][17]), rel=1e-12)
+    assert len(st["probes"]["mid"]) == 72 and all(len(p) == 3 for p in st["probes"]["mid"])
+    crank = st["loads"]["j_crank"]
+    assert (crank["unit"], crank["reflected_from"]) == ("N·m", None)
+    assert crank["series"] == pytest.approx(loads["j_crank"]["series"], rel=1e-12, abs=1e-15)
+    assert len(st["residual"]) == 72 and max(st["residual"]) < 1e-9
+
+
+def test_series_json_open_frames_are_null_not_nan(tmp_path):
+    from conftest import make_four_bar
+
+    analyze(make_four_bar(coupler=45.0), out_root=tmp_path)  # the loop opens over part of the turn
+    st = _strict_load(tmp_path / "four_bar.mech" / "series.json")["studies"][0]
+    assert False in st["ok"] and True in st["ok"]
+    open_k = st["ok"].index(False)
+    assert st["loads"]["j_crank"]["series"][open_k] is None  # undefined at an open frame
+    assert st["residual"][open_k] > 1e-3
+
+
+def test_report_has_the_cog_of_every_part(tmp_path):
+    """mass.parts_com_mm: each part's centre of mass at home (world mm), next to mass.parts (g)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_export_two", Path(__file__).parent / "fixtures" / "two_studies.py")
+    two = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(two)
+    report = analyze(two.build(), export=False, out_root=tmp_path)
+    com = report["mass"]["parts_com_mm"]
+    assert set(com) == set(report["mass"]["parts"]) == {"base", "post", "arm"}
+    c = 30.0 / math.sqrt(2)  # report numbers carry 6 significant figures
+    np.testing.assert_allclose(com["arm"], [20.0, 0.0, 10.0], rtol=1e-5, atol=1e-6)  # Box(40, 4, 4) at (20, 0, 10)
+    np.testing.assert_allclose(com["post"], [c, c, 10.0], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(com["base"], [0.0, 0.0, -2.0], rtol=1e-5, atol=1e-6)
+    # the assembly CoG is the mass-weighted mean of the parts'
+    m = report["mass"]["parts"]
+    total = sum(m.values())
+    mean = sum(np.asarray(com[n]) * m[n] for n in m) / total
+    np.testing.assert_allclose(report["mass"]["com_mm"], mean, rtol=1e-5, atol=1e-5)
+
+
+def test_virtual_parts_are_not_exported_counted_or_weighed(tmp_path):
+    """A ``virtual`` part (the internal knuckle of a spherical joint) has no STL, no scene entry, no
+    mass, and does not count as a part or a checked pair."""
+    asm = Assembly("knuckled", clearance=0.3)
+    asm.part("base", Pos(0, 0, -3) * Box(80, 80, 4), ground=True)
+    asm.part("arm", Pos(20, 0, 2) * Box(40, 6, 4))
+    asm.part("knuckle", Pos(0, 0, 30) * Box(1, 1, 1), material="steel")
+    asm.revolute("j_arm", "base", "arm", origin=(0, 0, 0), axis=(0, 0, 1))
+    asm.fix("knuckle", "arm")
+    asm.study("swing", drive={"j_arm": (0, 90)}, frames=4)
+    plain = analyze(asm, export=False, out_root=tmp_path)
+    asm.parts["knuckle"].virtual = True
+    report = analyze(asm, out_root=tmp_path)
+    out = tmp_path / "knuckled.mech"
+    assert sorted(p.name for p in (out / "parts").iterdir()) == ["arm.stl", "base.stl"]
+    scene = _strict_load(out / "scene.json")
+    assert [p["id"] for p in scene["parts"]] == ["base", "arm"]
+    assert set(scene["studies"][0]["transforms"]) == {"arm"}
+    assert report["parts"] == 2 and plain["parts"] == 3
+    assert set(report["mass"]["parts"]) == {"base", "arm"}
+    knuckle = plain["mass"]["parts"]["knuckle"]  # 1 mm³ of steel
+    assert knuckle > 0 and report["mass"]["total_g"] == pytest.approx(plain["mass"]["total_g"] - knuckle, rel=1e-5)
+    assert report["clearance"]["pairs_checked"] == plain["clearance"]["pairs_checked"] - 1  # base/knuckle
+
+
+def test_ball_joints_are_listed_for_the_viewer(tmp_path):
+    """scene.json lists each ball() (name, parent, child, home center, its three revolutes): the
+    revolutes chain through virtual knuckles that have no mesh or transforms, so the viewer draws
+    the ball at its center (carried by the parent) instead of those joints' axes."""
+    asm = Assembly("balled", clearance=0.3)
+    asm.part("post", Pos(0, 0, -10) * Box(10, 10, 20), ground=True)
+    asm.part("arm", Pos(0, 0, 28) * Box(6, 6, 50))  # 3 mm above the ball center on the post top
+    assert asm.ball("s", "post", "arm", (0, 0, 0)) == "s"
+    asm.study("tilt", drive={"s_1": (0, 30)}, frames=4)
+    report = analyze(asm, out_root=tmp_path)
+    assert report["status"] == "PASS", report["issues"]
+    scene = _strict_load(tmp_path / "balled.mech" / "scene.json")
+    assert scene["balls"] == [{"name": "s", "parent": "post", "child": "arm", "center": [0, 0, 0],
+                               "joints": ["s_1", "s_2", "s_3"]}]
+    assert {j["name"] for j in scene["joints"]} == {"s_1", "s_2", "s_3"}
+    assert [p["id"] for p in scene["parts"]] == ["post", "arm"]          # no knuckle meshes …
+    assert set(scene["studies"][0]["transforms"]) == {"arm"}             # … nor transforms

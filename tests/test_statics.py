@@ -199,3 +199,51 @@ def test_actuator_held_still_by_the_study_is_rated():
     assert arm["reflected_from"] is None
     # V = m g y_com, y_com = 20 sin θ mm: dV/dθ = m g · 0.020 N·m at θ = 0 in every frame
     np.testing.assert_allclose(arm["series"], props["arm"].mass_kg * G * 0.020, rtol=1e-6)
+
+
+# ------------------------------------------------------------------------------ round-off loads (A4)
+
+
+def tilted_vertical(tilt_axis: float = 0.0) -> Assembly:
+    """A yaw arm and a slide whose axes are parallel to a tilted gravity (gravity ∥ axis: no load),
+    with the hinge axis optionally tilted ``tilt_axis`` rad off it."""
+    a = math.radians(17.0)
+    down = np.array([0.0, -math.sin(a), -math.cos(a)])
+    asm = Assembly("yaw", gravity=G * down)
+    asm.part("base", Pos(0, 0, -10) * Box(40, 40, 10), ground=True)
+    asm.part("arm", Pos(60, 0, 3) * Box(120, 10, 6), material="steel")
+    asm.part("slide", Pos(0, 50, 3) * Box(10, 10, 6), material="steel")
+    axis = -down * math.cos(tilt_axis) + np.array([1.0, 0.0, 0.0]) * math.sin(tilt_axis)
+    asm.revolute("j_yaw", "base", "arm", origin=(0, 0, 0), axis=axis)
+    asm.prismatic("j_lift", "base", "slide", origin=(0, 50, 0), axis=np.cross(-down, (1.0, 0, 0)))
+    asm.actuator("j_yaw", capacity=0.5)
+    asm.actuator("j_lift", capacity=10.0)
+    return asm
+
+
+def test_round_off_loads_are_exactly_zero(monkeypatch):
+    """Loads zero by geometry come out of the finite differences as ~1e-17 round-off (desktop_arm's
+    j_yaw_motor 3.42e-17 N·m 'SF 1.17e16'): they are reported as exactly 0.0."""
+    import mech.statics as statics
+
+    asm = tilted_vertical()
+    kin, props = Kinematics(asm), props_of(asm)
+    res = run_study(asm, kin, Study("spin", {"j_yaw": (0, 300), "j_lift": (0, 30)}, frames=11))
+    monkeypatch.setattr(statics, "_ZERO_RTOL", 0.0)
+    raw = gravity_loads(asm, kin, res, props)
+    assert 0 < raw["j_yaw"]["max_abs"] < 1e-12  # the round-off the fix removes
+    monkeypatch.undo()
+    loads = gravity_loads(asm, kin, res, props)
+    for name in ("j_yaw", "j_lift"):
+        assert loads[name]["series"] == [0.0] * 11 and loads[name]["max_abs"] == 0.0 and loads[name]["frame"] == 0
+    assert all(type(v) is float for v in loads["j_yaw"]["series"])
+
+
+def test_small_real_loads_are_not_zeroed():
+    """A hinge axis 1e-6 rad off gravity carries a real (tiny) load, 1e-6 of m·g·r: kept."""
+    asm = tilted_vertical(tilt_axis=1e-6)
+    kin, props = Kinematics(asm), props_of(asm)
+    res = run_study(asm, kin, Study("spin", {"j_yaw": (0, 90)}, frames=4))
+    load = gravity_loads(asm, kin, res, props)["j_yaw"]
+    m, r = props["arm"].mass_kg, 0.06
+    assert load["max_abs"] == pytest.approx(m * G * r * 1e-6, rel=1e-3)

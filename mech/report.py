@@ -7,13 +7,27 @@ home-world location, every driver's value at the frame, the driver sub-range whe
 which limit a passive joint breaks and where). ``attach_targets`` folds the target results in
 afterwards (the runner evaluates targets on the built report).
 
-``format_summary`` renders a report as ≤ 15 lines in a fixed order —
+``format_summary`` renders a report as ≤ 15 lines of ≤ 250 characters in a fixed order —
 header · FAIL · target_miss · WARN · INFO · loops · clearance · loads · targets · ranges · Δprev ·
 view — deduplicating issues across studies and dropping the least important lines first when over
-budget. A partial run (``--study``/``--frames``) says so in the header, and Δprev compares only
-the studies both runs sampled alike. Every float in the report goes through ``geom.fnum`` (6
-significant figures, None for non-finite) so the JSON never contains NaN/Infinity; the summary
-prints 3 significant figures.
+budget. Big models stay within the budget by folding what repeats: more than three loops are
+counted, gear meshes and allowed contacts fold into one line each, FAIL/WARN pair findings alike
+(same code, value, frame span: mirrored pairs off one cause) into the worst one's line, the reflected loads of unrated
+coupled joints into one line (rated actuators, drivers and joints a target names keep their own),
+zero and round-off loads into ``no gravity load on …``, joints and probes with identical ranges
+share one entry, and a ranges line that is still too wide keeps the drivers, the targeted joints
+and the probes and counts the rest (``(+36 passive — --verbose)``). FAIL/WARN/target_miss findings
+and the view line (URL, ``mech shot`` command, export path) are never cut. ``verbose`` lifts the
+line and width caps, unfolds everything and adds the sweep stats per study. A partial run
+(``--study``/``--frames``) says so in the header, and Δprev compares only the studies both runs
+sampled alike. Every float in the report goes through ``geom.fnum`` (6 significant figures, None
+for non-finite) so the JSON never contains NaN/Infinity; the summary prints 3 significant figures.
+
+report.json also carries each part's CoG (``mass.parts_com_mm``) and each study's
+``sweep_stats`` (``SweepResult.stats``: seconds, pairs, proximity, exact, booleans,
+subframe_poses, slowest, and sub_unresolved / unresolved_pairs when the between-frame guard left
+intervals unproven — also a ``subframe_unresolved`` INFO issue); ``virtual`` parts (the knuckles of a ball joint) are not counted,
+weighed or listed.
 """
 
 from __future__ import annotations
@@ -21,7 +35,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -31,7 +45,7 @@ import numpy as np
 from .geom import fnum, slug
 from .kinematics import RESIDUAL_TOL
 from .massprops import assembly_props
-from .targets import joint_series, path_length, probe_series
+from .targets import CALLABLE, is_zero_load, joint_series, load_scale, path_length, probe_series
 
 if TYPE_CHECKING:  # the analysis modules are only needed for type hints here
     from .assembly import Assembly
@@ -41,22 +55,26 @@ if TYPE_CHECKING:  # the analysis modules are only needed for type hints here
     from .motion import StudyResult
 
 __all__ = ["Issue", "build_report", "build_check_report", "invalid_report", "attach_targets", "format_summary",
-           "format_check", "jsonable", "issue_key", "sig", "decl", "vec", "extent", "SUMMARY_LINES"]
+           "format_check", "jsonable", "issue_key", "sig", "decl", "vec", "extent", "real_parts", "SUMMARY_LINES",
+           "SUMMARY_WIDTH"]
 
 Severity = Literal["FAIL", "WARN", "INFO"]
 
 SUMMARY_LINES = 15  # default line budget of format_summary
+SUMMARY_WIDTH = 250  # per-line width cap of format_summary (verbose lifts both caps)
+_FOLD_PINS = 3  # more loops than this are counted on the loops line, not named
+_FOLD_CONTACT = 3  # more contact INFO lines than this fold into one
 _SEVERITY_RANK = {"FAIL": 0, "WARN": 1, "INFO": 2}
 # Report order within a severity (most actionable first).
 _CODE_ORDER = ["invalid_model", "interference", "static_interference", "loop_open", "over_capacity",
                "tight_clearance", "joint_limit", "branch_jump", "singular_pose", "target_miss", "underconstrained",
-               "near_planar", "joint_off_part", "gear_mesh", "contact", "held_at_home"]
+               "near_planar", "joint_off_part", "gear_mesh", "contact", "subframe_unresolved", "held_at_home"]
 _CODE_RANK = {c: i for i, c in enumerate(_CODE_ORDER)}
 # Codes whose issue value measures how bad it is (bigger = worse, except a gap); others keep their order.
 _RANKED_BY_VALUE = {"interference", "static_interference", "loop_open", "over_capacity", "tight_clearance",
                     "joint_limit", "branch_jump", "singular_pose", "underconstrained", "contact"}
 _SMALLER_IS_WORSE = {"tight_clearance"}
-_SHORT = {"tight_clearance": "tight"}  # display names in the summary
+_SHORT = {"tight_clearance": "tight", "subframe_unresolved": "unresolved"}  # display names in the summary
 _SF_WARN = 1.5  # over_capacity WARN below this safety factor
 _STILL = 1e-9  # a joint range narrower than this counts as "did not move"
 MINUS = "−"
@@ -163,6 +181,8 @@ def _jv(value, kind: str | None) -> str:
 
 
 def _jrange(lo, hi, kind: str | None) -> str:
+    """``−13.2…48.9°``; an end within ``_STILL`` of 0 is solver round-off and prints as 0."""
+    lo, hi = (0.0 if v is not None and abs(float(v)) <= _STILL else v for v in (lo, hi))
     return f"{sig(lo)}…{sig(hi)}{_unit(kind)}"
 
 
@@ -225,26 +245,34 @@ class _StudyCtx:
     def _union(self, a: str, b: str) -> None:
         self._root[self._find(a)] = self._find(b)
 
+    def chain(self, parts: Iterable[str]) -> set[str]:
+        """The joints on the chains from ``parts`` to the ground."""
+        joints = set()
+        for p in parts:
+            seen = set()
+            while p not in seen and (j := self.asm.parent_joint(p)) is not None:
+                seen.add(p)
+                joints.add(j.name)
+                p = j.parent
+        return joints
+
     def movers(self, parts: Iterable[str] | None = None) -> list[str]:
         """The drivers (declaration order) that move any of ``parts``: on a part's joint chain to
         the ground, or acting on a loop / coupling that joint belongs to. All drivers without parts."""
         if not parts:
             return list(self.drivers)
-        chain = set()
-        for p in parts:
-            seen = set()
-            while p not in seen and (j := self.asm.parent_joint(p)) is not None:
-                seen.add(p)
-                chain.add(self._find(j.name))
-                p = j.parent
-        movers = [d for d in self.drivers if self._find(d) in chain]
+        groups = {self._find(j) for j in self.chain(parts)}
+        movers = [d for d in self.drivers if self._find(d) in groups]
         return movers or list(self.drivers)
 
     def values(self, k: int, parts: Iterable[str] | None = None, frac: float | None = None) -> dict[str, float]:
-        """Driver values at frame k (those that move ``parts``), then the coupled outputs they drive.
-        ``frac`` (e.g. 1.5, a hit found between frames 1 and 2) interpolates between its two frames,
-        as the sweep's sub-frame poses do."""
+        """Driver values at frame k (those that move ``parts``), then the coupled outputs they drive
+        — with ``parts``, only the coupled joints on those parts' chains (a planetary's sun driver
+        turns eight coupled joints; the ones that pose the pair are what locates it). ``frac``
+        (e.g. 1.5, a hit found between frames 1 and 2) interpolates between its two frames, as the
+        sweep's sub-frame poses do."""
         movers = self.movers(parts)
+        on_chain = self.chain(parts) if parts else None
         poses, n = self.result.poses, len(self.result.poses)
         k0, s = k, 0.0
         if frac is not None and 0 <= math.floor(frac) < n - 1:
@@ -258,7 +286,7 @@ class _StudyCtx:
         q0 = poses[k0].q if k0 < n else {}
         q1 = poses[k1].q if k1 < n else q0
         out.update({c: lerp(q0[c], q1.get(c, q0[c])) for c in self.coupled
-                    if c in q0 and _coupling_root(self.asm, c) in movers})
+                    if c in q0 and _coupling_root(self.asm, c) in movers and (on_chain is None or c in on_chain)})
         return out
 
     def at(self, k: int, parts: Iterable[str] | None = None, frac: float | None = None,
@@ -503,6 +531,22 @@ def _clearance_issues(asm: Assembly, ctx: _StudyCtx, sweep: SweepResult) -> list
     return issues
 
 
+def _unresolved_issues(ctx: _StudyCtx, sweep: SweepResult) -> list[Issue]:
+    """``subframe_unresolved`` INFO when the between-frame guard gave up on intervals without
+    proving them clear (``SweepResult.stats``: sub_unresolved, unresolved_pairs): there the
+    verdict rests on the frames alone."""
+    st = getattr(sweep, "stats", None) or {}
+    n = int(st.get("sub_unresolved") or 0)
+    if n <= 0:
+        return []
+    pairs = [row[:2] for row in st.get("unresolved_pairs") or [] if len(row) >= 2]
+    names = ["/".join(map(str, p)) for p in pairs]
+    shown = f" ({', '.join(names[:2])}{f' +{len(names) - 2}' if len(names) > 2 else ''})" if names else ""
+    msg = (f"{n} between-frame interval{'s' if n != 1 else ''} not proven clear{shown}: the sub-frame check "
+           f"gave up there, only the frames vouch for {'them' if n != 1 else 'it'} — more --frames sample finer")
+    return [Issue("INFO", "subframe_unresolved", msg, ctx.name, None, list(pairs[0]) if pairs else [], float(n))]
+
+
 def _fix_joint(asm: Assembly, a: str, b: str) -> str | None:
     for j in asm.joints.values():
         if j.kind == "fixed" and {j.parent, j.child} == {a, b}:
@@ -576,13 +620,18 @@ def _undefined_load_reason(result: StudyResult, mobility: int) -> str:
     return "singular at every closed frame"
 
 
-def _load_entries(asm: Assembly, loads: dict[str, dict], why: str | None = None) -> dict[str, dict]:
-    """report.json load entries; ``why`` is recorded for loads that came out undefined."""
+def _load_entries(asm: Assembly, loads: dict[str, dict], why: str | None = None,
+                  scale: float = 0.0) -> dict[str, dict]:
+    """report.json load entries; ``why`` is recorded for loads that came out undefined. A load that
+    is round-off against ``scale`` (the model's largest load; ``targets.is_zero_load``) is stored
+    as exactly 0 — gravity along the axis or a balanced pair, not a 3e-17 N·m holding torque."""
     out = {}
     for jname, ld in loads.items():
         act = asm.actuators.get(jname)
         cap = act.capacity if act is not None else None
         mx = ld.get("max_abs")
+        if mx is not None and is_zero_load(mx, scale):
+            mx = 0.0
         sf = cap / mx if cap is not None and mx is not None and mx > 0 else None
         out[jname] = {"unit": ld.get("unit"), "max_abs": fnum(mx), "frame": ld.get("frame"),
                       "capacity": fnum(cap), "sf": fnum(sf), "reflected_from": ld.get("reflected_from")}
@@ -685,10 +734,17 @@ def _held_at_home(asm: Assembly, kin: Kinematics, roles: dict[str, str], drivers
     return [Issue("INFO", "held_at_home", f"{what} — not driven by {by}", None, None, [j.child for j in held])]
 
 
+def real_parts(asm: Assembly) -> list[str]:
+    """The parts the user modelled, in declaration order — without ``virtual`` bodies (the internal
+    knuckles of a spherical joint), which no export, mass table, count or summary should show."""
+    return [n for n, p in asm.parts.items() if not getattr(p, "virtual", False)]
+
+
 def _pair_counts(asm: Assembly) -> dict:
     """What the clearance sweep covers: the part pairs that move relative to each other (not
-    ignored, not in one rigid group) and how many of them may touch (allow_contact / meshing)."""
-    groups, meshing, names = asm.rigid_groups(), asm.meshing_pairs(), list(asm.parts)
+    ignored, not in one rigid group) and how many of them may touch (allow_contact / meshing).
+    ``virtual`` bodies are never checked, so they are not counted."""
+    groups, meshing, names = asm.rigid_groups(), asm.meshing_pairs(), real_parts(asm)
     checked = allowed = 0
     for i, a in enumerate(names):
         for b in names[i + 1:]:
@@ -713,7 +769,9 @@ def build_report(asm: Assembly, kin: Kinematics, props: dict[str, MassProps], re
     ``out_dir`` is the export root when it is not the ``<repo>/output`` the viewer serves.
     """
     issues: list[Issue] = [Issue("WARN", code, msg) for code, msg in asm.validate_warnings()]
-    mass = assembly_props(asm, props)
+    real = real_parts(asm)
+    mass = assembly_props(asm, {n: props[n] for n in real if n in props})  # virtual bodies weigh nothing
+    scale = load_scale(loads)  # round-off loads are judged against the model's largest load
     studies_out, mobility = [], {}
     for name, res in results.items():
         ctx = _StudyCtx(asm, name, res, kin)
@@ -727,13 +785,14 @@ def build_report(asm: Assembly, kin: Kinematics, props: dict[str, MassProps], re
         sweep = sweeps.get(name)
         if sweep is not None:
             issues += _clearance_issues(asm, ctx, sweep)
-        entries = _load_entries(asm, loads.get(name, {}), _undefined_load_reason(res, m))
+            issues += _unresolved_issues(ctx, sweep)
+        entries = _load_entries(asm, loads.get(name, {}), _undefined_load_reason(res, m), scale)
         issues += _capacity_issues(asm, ctx, entries)
         studies_out.append(_study_entry(asm, ctx, sweep, entries))
     issues += _home_issues(asm, home, swept=bool(sweeps))
     issues += _contact_issues(asm, sweeps, home)
-    issues += [Issue("INFO", "gear_mesh", f"{'/'.join(sorted(p))} meshing (gear/rack coupling): contact allowed, "
-                     f"interference still checked", parts=sorted(p)) for p in sorted(asm.meshing_pairs(), key=sorted)]
+    issues += [Issue("INFO", "gear_mesh", f"{'/'.join(sorted(p))} meshing: contact allowed, interference still "
+                     f"checked", parts=sorted(p)) for p in sorted(asm.meshing_pairs(), key=sorted)]
     if results:
         drivers = {d for res in results.values() for d in res.study.drive}
     else:  # mech check: judged over every study's drivers
@@ -748,14 +807,15 @@ def build_report(asm: Assembly, kin: Kinematics, props: dict[str, MassProps], re
         "status": "PASS",
         "params": dict(asm.params),
         "partial": partial,
-        "parts": len(asm.parts),
+        "parts": len(real),
         "joints": counts,
         "roles": dict(roles),
         "joint_kinds": {n: j.kind for n, j in asm.joints.items()},
         "pins": [p.name for p in asm.pins],
         "mobility": mobility,
         "mass": {"total_g": mass.mass_kg * 1000.0, "com_mm": mass.com.tolist(),
-                 "parts": {n: mp.mass_kg * 1000.0 for n, mp in props.items()}},
+                 "parts": {n: props[n].mass_kg * 1000.0 for n in real if n in props},
+                 "parts_com_mm": {n: np.asarray(props[n].com, dtype=float).tolist() for n in real if n in props}},
         "issues": _sort_issues(issues),
         "targets": [],
         "studies": studies_out,
@@ -831,8 +891,10 @@ def _study_entry(asm: Assembly, ctx: _StudyCtx, sweep: SweepResult | None, loads
         if frac is not None:
             mc["subframe"] = frac
     residuals = [p.residual for p in res.poses]
+    stats = getattr(sweep, "stats", None) if sweep is not None else None  # SweepResult.stats (§4.6)
     return {"name": ctx.name, "frames": len(res.poses), "joint_ranges": ranges, "probes": probes,
-            "min_clearance": mc, "loads": loads, "max_residual": max(residuals) if residuals else 0.0}
+            "min_clearance": mc, "loads": loads, "max_residual": max(residuals) if residuals else 0.0,
+            "sweep_stats": jsonable(dict(stats)) if stats else None}
 
 
 def _subframe(sweep: SweepResult, a: str, b: str, value: float, frame: int) -> float | None:
@@ -866,16 +928,23 @@ def _target_miss_message(t: dict) -> str:
     """``label: metric value < min X (margin −d)`` — the violated bound and the signed margin
     are always named (the value is rounded, the margin says by how much it misses)."""
     v = t.get("value")
+    head = f"{t['label']}:" + _metric_tag(t)
     if v is None:
         why = t.get("error") or "undefined"
-        return f"{t['label']}: {t['metric']} n/a ({why})"
+        return f"{head} n/a ({why})"
     lo, hi = t.get("min"), t.get("max")
     if lo is None and hi is None:
-        return f"{t['label']}: {t['metric']} {sig(v)}"
+        return f"{head} {sig(v)}"
     below = lo is not None and (hi is None or abs(v - lo) <= abs(v - hi))  # outside: the nearer bound is crossed
     bound = f"< min {decl(lo)}" if below else f"> max {decl(hi)}"
     margin = f" (margin {sig(t['margin'])})" if t.get("margin") is not None else ""
-    return f"{t['label']}: {t['metric']} {sig(v)} {bound}{margin}"
+    return f"{head} {sig(v)} {bound}{margin}"
+
+
+def _metric_tag(t: dict) -> str:
+    """`` span:j_rocker`` after a target's label — nothing for a callable, whose label is its name."""
+    metric = t.get("metric")
+    return "" if not metric or metric == CALLABLE else f" {metric}"
 
 
 def attach_targets(report: dict, targets: list[dict], prev: dict | None = None) -> dict:
@@ -990,7 +1059,9 @@ def _delta_prev(report: dict, prev: dict | None) -> dict:
     (others are listed under ``not_compared``) plus study-independent findings, and targets
     evaluated over the same studies. So a ``--study``/``--frames`` run never calls an issue of a
     study it skipped or sampled differently "fixed", and the status is compared only when both
-    runs sampled the same studies.
+    runs sampled the same studies. This run's FAIL/WARN findings left out that way are counted
+    under ``not_compared_issues`` (``{"FAIL": n, "WARN": m}``), so the line never says "no change"
+    over findings it did not compare.
     """
     if not prev:
         return {"first_run": True}
@@ -1011,20 +1082,27 @@ def _delta_prev(report: dict, prev: dict | None) -> dict:
         comparable = [label for label, t in now_t.items() if label in old_t
                       and (same or t.get("metric") == "mass_g" or (t.get("study") is not None and t["study"] in common))]
 
-        def keys(r: dict) -> set[tuple]:
+        def keys(r: dict, left_out: dict | None = None) -> set[tuple]:
             found = set()
             for i in r.get("issues") or []:
                 if i.get("severity") not in ("FAIL", "WARN"):
                     continue
                 if i["code"] == "target_miss":
                     if issue_key(i)[1] not in comparable:
+                        if left_out is not None and issue_key(i)[1] in old_t:  # (added targets: reported apart)
+                            left_out[i["severity"]] = left_out.get(i["severity"], 0) + 1
                         continue  # added/removed, or evaluated over other studies: reported apart
                 elif i.get("study") is not None and i["study"] not in common:
+                    if left_out is not None:
+                        left_out[i["severity"]] = left_out.get(i["severity"], 0) + 1
                     continue
                 found.add(issue_key(i))
             return found
 
-        old, new = keys(prev), keys(report)
+        left: dict[str, int] = {}
+        old, new = keys(prev), keys(report, left)
+        if left:  # this run's findings outside the shared scope: never "no change"
+            out["not_compared_issues"] = {sev: left[sev] for sev in ("FAIL", "WARN") if sev in left}
         if old - new:
             out["fixed"] = sorted(_key_label(k) for k in old - new)
         if new - old:
@@ -1071,7 +1149,7 @@ def _listed(items: list[str], verbose: bool, n: int = 3) -> str:
     return f"{', '.join(items[:n])} (+{len(items) - n} more — --verbose)"
 
 
-def _format_delta(d: dict | None, verbose: bool = False) -> str:
+def _format_delta(d: dict | None, verbose: bool = False, width: int | None = None) -> str:
     if d is None or d.get("first_run"):
         return "Δprev: first run"
     if d.get("unreadable"):
@@ -1099,29 +1177,91 @@ def _format_delta(d: dict | None, verbose: bool = False) -> str:
         bits.append(f"mass {sig(a)}→{sig(b)} g")
     for label, (a, b) in (d.get("targets") or {}).items():
         bits.append(f"{label} {sig(a)}→{sig(b)}")
-    skipped = d.get("not_compared")
-    note = "not compared: " + ", ".join(f"{name} ({why})" for name, why in skipped.items()) if skipped else ""
-    if not bits:
-        return "Δprev: no change" + (f" ({note})" if note else "")
-    return "Δprev: " + " · ".join(bits + ([note] if note else []))
+    skipped = d.get("not_compared") or {}
+    left = d.get("not_compared_issues") or {}
+    items = [f"{n} {sev}" for sev, n in left.items()] + [f"{name} ({why})" for name, why in skipped.items()]
+    note = "not compared: " + ", ".join(items) if items else ""
+    if not bits:  # with findings left out of the comparison, nothing is known to be unchanged
+        return ("Δprev: no change in the shared scope" if left else "Δprev: no change") + (f" ({note})" if note else "")
+    return _join(bits, [note] if note else [], width=width, more="more — --verbose", head="Δprev:", keep=1)
 
 
 # ================================================================================================
 # summary
 # ================================================================================================
+#
+# Width: every line is kept within SUMMARY_WIDTH characters (verbose: unlimited) by construction
+# where it lists things — ranges, targets, loops, roles, Δprev drop their tail items for one
+# ``(+N … — --verbose)`` marker and never cut an item in half — and by ``_clip`` (a word-break cut
+# with ``…``) as a last resort for the header, INFO and context lines. Two kinds of line are never
+# cut: a FAIL/WARN/target_miss finding (its message is the fix; a long study list is shortened to
+# ``[first +N]`` instead) and the view line, whose viewer URL, ``mech shot`` command and export
+# path are meant to be copied (its prose is shortened instead).
 
 
 @dataclass
 class _Line:
     text: str
     tally: str  # what the overflow line counts it as, e.g. "WARN tight", "INFO", "load"
+    clip: bool = True  # False: never cut to the width (a FAIL/WARN/target_miss finding)
+
+
+_SEP = " · "
+
+
+def _clip(text: str, width: int | None) -> str:
+    """``text`` cut to ``width`` characters with a trailing ``…`` (at a word break when one is near)."""
+    if width is None or len(text) <= width:
+        return text
+    cut = text[: width - 1]
+    space = cut.rfind(" ")
+    if space > width * 0.7:
+        cut = cut[:space]
+    return cut.rstrip(" ·,;") + "…"
+
+
+def _join(bits: list[str], tail: list[str] | None = None, *, width: int | None = SUMMARY_WIDTH,
+          more: str | Callable[[int, int], str] = "…", head: str | None = None, hidden: int = 0,
+          keep: int = 0) -> str:
+    """``head`` (a word followed by a space) + ``bits`` joined with `` · `` within ``width``: bits
+    are dropped from the end (never the first ``keep``) for one ``(+N <more>)`` marker, N counting
+    the dropped bits and the ``hidden`` items the caller already left out; ``tail`` bits are always
+    kept, after the marker. ``more`` is the marker label, or a callable ``(dropped, hidden) -> text``.
+    Only when even the ``keep`` bits do not fit is the text cut (``_clip``)."""
+    tail = list(tail or [])
+    prefix = f"{head} " if head else ""
+    keep = min(keep, len(bits))
+
+    def marker(dropped: int) -> list[str]:
+        if dropped + hidden == 0:
+            return []
+        return [more(dropped, hidden) if callable(more) else f"(+{dropped + hidden} {more})"]
+
+    def text(n: int) -> str:
+        return prefix + _SEP.join(bits[:n] + marker(len(bits) - n) + tail)
+
+    full = text(len(bits))
+    if width is None or len(full) <= width:
+        return full
+    for n in range(len(bits) - 1, keep - 1, -1):
+        if len(text(n)) <= width:
+            return text(n)
+    return _clip(text(keep), width)
+
+
+def _more(n: int, what: str = "more") -> str:
+    return f"(+{n} {what} — --verbose)"
+
+
+# ------------------------------------------------------------------------------ lines
 
 
 def _dedup(report: dict) -> list[tuple[dict, list[str]]]:
-    """Issues deduplicated on (code, part pair) across studies: (worst issue, study names)."""
+    """Issues deduplicated on (code, part pair) across studies: (worst issue, study names). Every
+    model error (``invalid_model``) is its own line — five errors about one joint are five findings."""
     groups: dict[tuple, tuple[dict, list[str]]] = {}
-    for i in report["issues"]:  # already worst-first, so the first of a group is its worst
-        key = issue_key(i)
+    for n, i in enumerate(report["issues"]):  # already worst-first, so the first of a group is its worst
+        key = (i["code"], n) if i["code"] == "invalid_model" else issue_key(i)
         if key not in groups:
             groups[key] = (i, [])
         if i.get("study") and i["study"] not in groups[key][1]:
@@ -1129,11 +1269,76 @@ def _dedup(report: dict) -> list[tuple[dict, list[str]]]:
     return list(groups.values())
 
 
-def _issue_line(issue: dict, studies: list[str], multi: bool) -> _Line:
+def _issue_line(issue: dict, studies: list[str], multi: bool, width: int | None = None,
+                alike: list[dict] | None = None) -> _Line:
+    """``FAIL interference a/b … [dig, boom]``. A FAIL/WARN line is never cut: when it is too wide its
+    study list shortens to ``[dig +2]`` (the message carries the fix and stays whole). ``alike``: the
+    findings folded into this one (``_fold_alike``), named after it — ``WARN tight 7 pairs alike:
+    c_R2/upper_R2 gap 0.200 mm < 0.5 … · also c_L0/upper_L0, k_L0/k_R0 (+4 — --verbose)``."""
+    sev = issue["severity"]
     short = _SHORT.get(issue["code"], issue["code"])
+    count = f"{len(alike) + 1} pairs alike: " if alike else ""
+    head = f"{sev:<4} {short} {count}{issue['message']}"
     tag = f" [{', '.join(studies)}]" if multi and studies else ""
-    tally = "INFO" if issue["severity"] == "INFO" else f"{issue['severity']} {short}"
-    return _Line(f"{issue['severity']:<4} {short} {issue['message']}{tag}", tally)
+    if width is not None and len(head) + len(tag) > width and multi and len(studies) > 1:
+        tag = f" [{studies[0]} +{len(studies) - 1}]"
+    also = ""
+    if alike:
+        names = ["/".join(i.get("parts") or []) or str(issue_key(i)[1]) for i in alike]
+        also = f" · also {', '.join(names[:2])}" + (f" {_more(len(names) - 2)}" if len(names) > 2 else "")
+    tally = "INFO" if sev == "INFO" else f"{sev} {short}"
+    return _Line(head + tag + also, tally, clip=sev == "INFO")
+
+
+_FOLDABLE = {"interference", "static_interference", "tight_clearance"}  # pair findings _fold_alike merges
+_SPAN = re.compile(r"\((\d+ frames [^)]*)\)\s*$")  # a pair finding's "(61 frames f0–f60)" tail
+
+
+def _fold_alike(grouped: list[tuple[dict, list[str]]], verbose: bool) -> list[tuple[dict, list[str], list[dict]]]:
+    """(issue, studies, alike): FAIL/WARN pair findings with the same code, value (3 s.f.), frame
+    span and studies — mirrored or repeated pairs off by one cause (a ``gap`` param) — fold into
+    the worst one's line (``alike``: the rest); verbose lists every pair on its own line."""
+    out: list[tuple[dict, list[str], list[dict]]] = []
+    index: dict[tuple, int] = {}
+    for issue, studies in grouped:
+        if (not verbose and issue["severity"] in ("FAIL", "WARN") and issue["code"] in _FOLDABLE and issue.get("parts")
+                and issue.get("value") is not None):
+            m = _SPAN.search(issue.get("message", ""))
+            key = (issue["severity"], issue["code"], sig(issue.get("value")),
+                   m.group(1) if m else f"f{issue.get('frame')}", tuple(studies))
+            if key in index:
+                out[index[key]][2].append(issue)
+                continue
+            index[key] = len(out)
+        out.append((issue, studies, []))
+    return out
+
+
+def _fold_info(lines: list[tuple[dict, list[str]]], multi: bool, verbose: bool, width: int | None) -> list[_Line]:
+    """INFO lines, with the repetitive kinds folded (not when verbose): every ``gear_mesh`` pair on
+    one line naming the first three, and more than ``_FOLD_CONTACT`` ``contact`` pairs as one line
+    naming the deepest."""
+    out: list[_Line] = []
+    mesh = [i for i, _ in lines if i["code"] == "gear_mesh"]
+    contact = [(i, s) for i, s in lines if i["code"] == "contact"]
+    fold_mesh = not verbose and len(mesh) > 1
+    fold_contact = not verbose and len(contact) > _FOLD_CONTACT
+    for issue, studies in lines:
+        if issue["code"] == "gear_mesh" and fold_mesh:
+            if issue is mesh[0]:
+                pairs = ["/".join(i["parts"]) if i.get("parts") else str(issue_key(i)[1]) for i in mesh]
+                shown = pairs[:3] + ([f"+{len(pairs) - 3}"] if len(pairs) > 3 else [])
+                out.append(_Line(f"INFO gear_mesh {len(mesh)} meshing pairs ({', '.join(shown)}): contact allowed, "
+                                 f"interference still checked", "INFO"))
+            continue
+        if issue["code"] == "contact" and fold_contact:
+            if issue is contact[0][0]:  # the deepest: issues are sorted worst-first
+                head = _issue_line(issue, studies, multi).text
+                out.append(_Line(f"{head} · {len(contact)} allowed-contact pairs touch {_more(len(contact) - 1)}",
+                                 "INFO"))
+            continue
+        out.append(_issue_line(issue, studies, multi, width))
+    return out
 
 
 def _header(report: dict, title: str = "mech") -> str:
@@ -1164,7 +1369,9 @@ def _partial_tag(report: dict) -> str:
     return f" (partial run: {'; '.join(bits)})"
 
 
-def _loops_line(report: dict) -> str:
+def _loops_line(report: dict, verbose: bool = False, width: int | None = SUMMARY_WIDTH) -> str:
+    """``OK   loop p_B closed (max 6.96e-14 mm) · no branch jumps · mobility 0``; more than
+    ``_FOLD_PINS`` loops are counted (``18 loops closed``), not named (verbose names them)."""
     codes = {i["code"] for i in report["issues"]}
     pins = report.get("pins") or []
     mob = report.get("mobility") or {}
@@ -1172,7 +1379,12 @@ def _loops_line(report: dict) -> str:
     bits = []
     if pins:
         res = [s["max_residual"] for s in report.get("studies") or []]
-        name = f"loop {pins[0]}" if len(pins) == 1 else f"loops {', '.join(pins)}"
+        if len(pins) == 1:
+            name = f"loop {pins[0]}"
+        elif len(pins) > _FOLD_PINS and not verbose:  # strandbeest: 18 pins are a count, not a list
+            name = f"{len(pins)} loops"
+        else:
+            name = f"loops {', '.join(pins)}"
         if not res:
             bits.append(f"{name} (no studies run)")
         else:
@@ -1189,13 +1401,21 @@ def _loops_line(report: dict) -> str:
         vals = set(mob.values())
         bits.append(f"mobility {vals.pop()}" if len(vals) == 1 else
                     "mobility " + ", ".join(f"{s} {m}" for s, m in mob.items()))
-    return f"{'!!' if bad else 'OK':<4} " + " · ".join(bits)
+    return _join(bits, width=width, more="more — --verbose", head=f"{'!!' if bad else 'OK':<4}", keep=1)
+
+
+def _drivers_at(report: dict, at: dict | None) -> str:
+    """``j_crank=25.1°`` for the drivers in a ``min_clearance.at`` dict (coupled outputs, which the
+    drivers determine, are left out; every joint when the report carries no roles)."""
+    kinds, roles = report.get("joint_kinds") or {}, report.get("roles") or {}
+    shown = {j: v for j, v in (at or {}).items() if not roles or roles.get(j) == "driver"} or dict(at or {})
+    return ", ".join(f"{j}={_jv(v, kinds.get(j))}" for j, v in shown.items())
 
 
 def _clearance_line(report: dict) -> str:
     """``clearance min 2.06 mm (a/b @f38 j=25.1°) · required 0.3 · 21 pairs checked · 2 allowed-contact
-    pairs`` — the smallest gap among the pairs the clearance rule applies to, always shown."""
-    kinds = report.get("joint_kinds") or {}
+    pairs`` — the smallest gap among the pairs the clearance rule applies to, always shown; the pose
+    names the drivers only (the coupled joints they turn follow from them)."""
     studies = report.get("studies") or []
     best = None
     for s in studies:
@@ -1204,7 +1424,7 @@ def _clearance_line(report: dict) -> str:
             best = (mc, s["name"])
     if best:
         mc, study = best
-        at = ", ".join(f"{j}={_jv(v, kinds.get(j))}" for j, v in (mc.get("at") or {}).items())
+        at = _drivers_at(report, mc.get("at"))
         sub = mc.get("subframe")
         where = f"between f{math.floor(sub)}–f{math.floor(sub) + 1}" if sub is not None else f"@f{mc['frame']}"
         where += (f" {at}" if at else "") + (f" [{study}]" if len(studies) > 1 else "")
@@ -1228,40 +1448,98 @@ def _clearance_line(report: dict) -> str:
     return " · ".join(bits)
 
 
-def _load_lines(report: dict) -> list[_Line]:
+def _targeted_joints(report: dict, kinds: tuple[str, ...]) -> set[str]:
+    """Joints a target of one of the metric ``kinds`` (``span``, ``load``, …) names."""
+    out = set()
+    for t in report.get("targets") or []:
+        kind, _, arg = str(t.get("metric") or "").partition(":")
+        if kind.strip() in kinds and arg.strip():
+            out.add(arg.strip())
+    return out
+
+
+def _load_line(j: str, e: dict, study: str, multi: bool) -> _Line:
+    """``load j_sun max 0.148 N·m @f0 · capacity 0.4 → SF 2.70`` (``n/a (why)`` when undefined)."""
+    mx = e.get("max_abs")
+    if mx is None:
+        return _Line(f"load {j} n/a ({e.get('why') or 'no closed frame'})", "load")
+    where = f" @f{e['frame']}" if e.get("frame") is not None else ""
+    where += f" ({study})" if multi else ""
+    refl = f" (reflected from {e['reflected_from']})" if e.get("reflected_from") else ""
+    if e.get("capacity") is None:
+        tail = " · no actuator capacity"
+    else:
+        tail = f" · capacity {decl(e['capacity'])} → SF {sig(e['sf']) if e.get('sf') is not None else '∞'}"
+    return _Line(f"load {j} max {sig(mx)} {e.get('unit') or ''}{where}{refl}{tail}", "load")
+
+
+def _reflected_line(extra: list[tuple[str, dict, str]]) -> _Line:
+    """``reflected loads j_p2_0 1.39 N·m, j_c1 0.741 N·m, j_p1_0 0.278 N·m (+4 more — --verbose)``:
+    the loads the drivers' loads are reflected onto (unrated coupled joints), largest first."""
+    defined = sorted(((j, e) for j, e, _ in extra if e.get("max_abs") is not None),
+                     key=lambda je: -abs(je[1]["max_abs"]))
+    whys = sorted({e.get("why") or "no closed frame" for _, e, _ in extra if e.get("max_abs") is None})
+    n_undefined = sum(1 for _, e, _ in extra if e.get("max_abs") is None)
+    items = [f"{j} {sig(e['max_abs'])} {e.get('unit') or ''}".rstrip() for j, e in defined[:3]]
+    rest = [f"+{len(defined) - 3} more"] if len(defined) > 3 else []
+    if n_undefined:
+        rest.append(f"{n_undefined} n/a: {'; '.join(whys)}")
+    text = "reflected loads " + (", ".join(items) if items else "n/a")
+    return _Line(text + (f" ({'; '.join(rest)} — --verbose)" if rest else ""), "load")
+
+
+def _load_lines(report: dict, verbose: bool = False) -> list[_Line]:
+    """One line per rated actuator, driver and joint a ``load:``/``sf:`` target names (its largest
+    load over the studies). The other loads — unrated coupled joints the drivers' loads are
+    reflected onto — fold into one ``reflected loads`` line when there are two or more (verbose:
+    one line each). Zero and round-off loads (``targets.is_zero_load``) of rated actuators fold into
+    ``no gravity load on …``; those of other joints are left out."""
+    studies = report.get("studies") or []
     best: dict[str, tuple[dict, str]] = {}
-    for s in report.get("studies") or []:
+    for s in studies:
         for j, e in (s.get("loads") or {}).items():
             cur = best.get(j)
             mx = e.get("max_abs")
             if cur is None or (mx is not None and (cur[0].get("max_abs") is None or mx > cur[0]["max_abs"])):
                 best[j] = (e, s["name"])
-    multi = len(report.get("studies") or []) > 1
-    lines, unloaded = [], []
+    scale = load_scale(s.get("loads") for s in studies)
+    roles = report.get("roles") or {}
+    targeted = _targeted_joints(report, ("load", "sf"))
+    multi = len(studies) > 1
+    rows, unloaded = [], []  # rows: (joint, entry, study, shown on its own line)
     for j, (e, study) in best.items():
-        if e.get("max_abs") is None:
-            lines.append(_Line(f"load {j} n/a ({e.get('why') or 'no closed frame'})", "load"))
-            continue
-        if e["max_abs"] == 0:  # gravity along the joint axis (or balanced): nothing to hold
-            if e.get("capacity") is not None:
+        rated = e.get("capacity") is not None
+        mx = e.get("max_abs")
+        if mx is not None and is_zero_load(mx, scale):  # gravity along the axis (or balanced): nothing to hold
+            if rated:
                 unloaded.append(j)  # rated actuators are named once, without an arbitrary frame
             continue
-        where = f" @f{e['frame']}" if e.get("frame") is not None else ""
-        where += f" ({study})" if multi else ""
-        refl = f" (reflected from {e['reflected_from']})" if e.get("reflected_from") else ""
-        if e.get("capacity") is None:
-            tail = " · no actuator capacity"
-        else:
-            tail = f" · capacity {decl(e['capacity'])} → SF {sig(e['sf']) if e.get('sf') is not None else '∞'}"
-        lines.append(_Line(f"load {j} max {sig(e['max_abs'])} {e.get('unit') or ''}{where}{refl}{tail}", "load"))
+        rows.append((j, e, study, verbose or rated or roles.get(j) == "driver" or j in targeted))
+    extra = [(j, e, study) for j, e, study, own in rows if not own]
+    fold = len(extra) > 1  # folding a single load saves no line
+    lines = [_load_line(j, e, study, multi) for j, e, study, own in rows if own or not fold]
     if unloaded:
         axes = "axis" if len(unloaded) == 1 else "axes"
         lines.append(_Line(f"no gravity load on {', '.join(unloaded)} ({axes} ∥ g or balanced)", "load"))
+    if fold:
+        lines.append(_reflected_line(extra))
     return lines
 
 
 def _bounds(t: dict) -> str:
-    lo, hi, v = t.get("min"), t.get("max"), sig(t.get("value"))
+    """``25.0 = 25`` · ``43.12 ≤ 44.0 ≤ 44.88`` · ``2.70 ≥ 2``: the value at 3 significant figures —
+    more when that rounding would put a met value outside its printed bounds (an equality target
+    ``−0.333333 = −0.333333``, never ``−0.333`` between bounds that read −0.333333)."""
+    lo, hi, value = t.get("min"), t.get("max"), t.get("value")
+    v = sig(value)
+    if value is not None and math.isfinite(float(value)) and t.get("met") is not None:
+        for n in range(3, 10):
+            v = sig(value, n)
+            shown = float(v.replace(MINUS, "-"))
+            if ((lo is None or shown >= lo) and (hi is None or shown <= hi)) == bool(t["met"]):
+                break
+    if lo is not None and hi is not None and lo == hi:
+        return f"{v} = {decl(lo)}"
     if lo is not None and hi is not None:
         return f"{decl(lo)} ≤ {v} ≤ {decl(hi)}"
     if lo is not None:
@@ -1271,21 +1549,51 @@ def _bounds(t: dict) -> str:
     return v
 
 
-def _targets_line(report: dict) -> str | None:
+def _targets_line(report: dict, width: int | None = SUMMARY_WIDTH, verbose: bool = False) -> str | None:
+    """``targets 5/5 · ratio 25:1 25 ≤ 25.0 ≤ 25 · motor SF sf:j_sun 2.70 ≥ 2 · (+2 met — --verbose)``
+    — the met targets (a callable by its label alone), then ``not evaluated: <labels>``."""
     ts = report.get("targets") or []
     if not ts:
         return None
     met = [t for t in ts if t.get("met") is True]
     unevaluated = [t["label"] for t in ts if t.get("met") is None]
-    bits = [f"targets {len(met)}/{len(ts) - len(unevaluated)}"] + [f"{t['label']} {t['metric']} {_bounds(t)}"
+    bits = [f"targets {len(met)}/{len(ts) - len(unevaluated)}"] + [f"{t['label']}{_metric_tag(t)} {_bounds(t)}"
                                                                    for t in met]
-    if unevaluated:
-        bits.append(f"not evaluated: {', '.join(unevaluated)}")
-    return " · ".join(bits)
+    tail = [f"not evaluated: {_listed(unevaluated, verbose)}"] if unevaluated else []
+    return _join(bits, tail, width=width, more="met — --verbose", keep=1)
 
 
-def _ranges_line(report: dict) -> str | None:
-    kinds = report.get("joint_kinds") or {}
+def _grouped(stats: dict[str, str], collapse: bool) -> list[tuple[list[str], str]]:
+    """``[(names, stats text)]`` in first-appearance order; with ``collapse`` the names whose stats
+    print identically share one entry (the six feet of a walker, three identical planets)."""
+    groups: dict[str, list[str]] = {}
+    for name, text in stats.items():
+        groups.setdefault(text if collapse else name, []).append(name)
+    return [(names, stats[names[0]]) for names in groups.values()]
+
+
+def _names(names: list[str]) -> str:
+    """``a`` · ``a, b`` · ``a…f`` (first…last of three or more)."""
+    return f"{names[0]}…{names[-1]}" if len(names) > 2 else ", ".join(names)
+
+
+def _probe_bits(probes: dict[str, dict], collapse: bool = True) -> list[tuple[str, int]]:
+    """``(probe mid Δ(71.1, 58.0, 0) path 197 mm, 1)``; probes with identical stats collapse into
+    ``(probes foot_L0…foot_R2 Δ(67.8, 0, 22.5) path 149 mm ×6, 6)``."""
+    stats = {p: f"Δ{vec(np.subtract(e['max'], e['min']))} path {sig(e['path'])} mm" for p, e in probes.items()}
+    return [(f"probe {names[0]} {text}", 1) if len(names) == 1 else
+            (f"probes {_names(names)} {text}" + (f" ×{len(names)}" if len(names) > 2 else ""), len(names))
+            for names, text in _grouped(stats, collapse)]
+
+
+def _ranges_line(report: dict, verbose: bool = False, width: int | None = SUMMARY_WIDTH) -> str | None:
+    """Joint ranges and probe stats collapsed across studies (closed frames). Joints and probes
+    whose ranges print identically share one entry (``j_p1_0…j_p1_2 −192…0° ×3``; not when
+    verbose). Every moving joint is listed when the line fits; otherwise the drivers and the joints
+    ``span``/``min``/``max`` targets name, then the probes, then ``(+36 passive — --verbose)`` —
+    over the width, probes and then joints drop from the end into that marker
+    (``(+10: 3 probes, 7 passive — --verbose)``)."""
+    kinds, roles = report.get("joint_kinds") or {}, report.get("roles") or {}
     joints: dict[str, list[float]] = {}
     probes: dict[str, dict] = {}
     for s in report.get("studies") or []:
@@ -1297,12 +1605,73 @@ def _ranges_line(report: dict) -> str | None:
             cur["min"] = [min(a, b) for a, b in zip(cur["min"], e["min"])]
             cur["max"] = [max(a, b) for a, b in zip(cur["max"], e["max"])]
             cur["path"] = max(cur["path"], e["path_mm"])
-    bits = [f"{j} {_jrange(lo, hi, kinds.get(j))}" for j, (lo, hi) in joints.items() if hi - lo > _STILL]
-    bits += [f"probe {p} Δ{vec(np.subtract(e['max'], e['min']))} path {sig(e['path'])} mm" for p, e in probes.items()]
-    return "ranges " + " · ".join(bits) if bits else None
+    moving = {j: (lo, hi) for j, (lo, hi) in joints.items() if hi - lo > _STILL}
+    collapse = not verbose
+    probe_items = [(text, n, "probe") for text, n in _probe_bits(probes, collapse)]
+    if not moving and not probe_items:
+        return None
+
+    def joint_items(names: Iterable[str]) -> list[tuple[str, int, str]]:
+        stats = {j: _jrange(*moving[j], kinds.get(j)) for j in names}
+        return [(f"{_names(group)} {text}" + (f" ×{len(group)}" if len(group) > 2 else ""), len(group), "joint")
+                for group, text in _grouped(stats, collapse)]
+
+    items = joint_items(moving) + probe_items
+    full = _join([text for text, _, _ in items], width=None, head="ranges")
+    if verbose or width is None or len(full) <= width:
+        return full
+    targeted = _targeted_joints(report, ("span", "min", "max"))
+    essential = [j for j in moving if roles.get(j) == "driver" or j in targeted]
+    hidden = [j for j in moving if j not in essential]
+    counts: dict[str, int] = {}
+    for j in hidden:
+        role = roles.get(j) or "passive"
+        counts[role] = counts.get(role, 0) + 1
+    items = joint_items(essential) + probe_items
+
+    def marker(dropped: int, n_hidden: int) -> str:
+        """``(+36 passive — --verbose)`` / ``(+10: 3 probes, 7 passive — --verbose)``."""
+        tail = items[len(items) - dropped:] if dropped else []
+        n_joints = sum(n for _, n, kind in tail if kind == "joint")
+        n_probes = sum(n for _, n, kind in tail if kind == "probe")
+        parts = ([f"{n_joints} joint{'s' if n_joints != 1 else ''}"] if n_joints else []) + \
+            [f"{n} {role}" for role, n in counts.items()] + \
+            ([f"{n_probes} probe{'s' if n_probes != 1 else ''}"] if n_probes else [])
+        total = n_joints + n_probes + n_hidden
+        if len(parts) == 1:
+            return f"(+{total} {parts[0].split(' ', 1)[1]} — --verbose)"
+        return f"(+{total}: {', '.join(parts)} — --verbose)"
+
+    return _join([text for text, _, _ in items], width=width, head="ranges", more=marker, hidden=len(hidden))
 
 
-def _view_line(report: dict) -> str:
+def _perf_lines(report: dict) -> list[_Line]:
+    """``--verbose`` only: one line per swept study from ``SweepResult.stats`` — seconds, pair and
+    query counts and the three slowest pairs. Keys that a sweep did not record are left out."""
+    lines = []
+    for s in report.get("studies") or []:
+        st = s.get("sweep_stats")
+        if not st:
+            continue
+        bits = [f"sweep {s['name']}"]
+        if st.get("seconds") is not None:
+            bits[0] += f" {sig(st['seconds'])} s"
+        for key, label in (("pairs", "pairs"), ("proximity", "proximity"), ("exact", "exact"),
+                           ("booleans", "booleans"), ("subframe_poses", "sub-frame poses")):
+            if st.get(key) is not None:
+                bits.append(f"{st[key]} {label}")
+        if st.get("sub_unresolved"):
+            bits.append(f"{st['sub_unresolved']} unresolved")
+        slow = [row for row in (st.get("slowest") or []) if isinstance(row, (list, tuple)) and len(row) >= 3]
+        if slow:
+            bits.append("slowest " + ", ".join(f"{a}/{b} {sig(sec)} s" for a, b, sec in slow[:3]))
+        lines.append(_Line(" · ".join(bits), "sweep stats"))
+    return lines
+
+
+def _view_line(report: dict, width: int | None = SUMMARY_WIDTH) -> str:
+    """The last line: viewer URL + ``mech shot`` command. Never cut: when an export path makes it too
+    wide, the prose around the command shortens instead."""
     name = slug(report["name"])
     if report.get("partial"):
         return (f"view: not exported — partial run; {name}.mech keeps the last full run "
@@ -1311,8 +1680,11 @@ def _view_line(report: dict) -> str:
         return f"view: not exported (drop --no-export to write output/{name}.mech)"
     if report.get("out_dir"):  # not the <repo>/output the viewer and a bare `mech shot` read
         d = report["out_dir"]
-        return (f"view: exported to {d} (the viewer serves <repo>/output only) · "
-                f"shot: uv run mech shot {name} --output-dir {d}")
+        shot = f"shot: uv run mech shot {name} --output-dir {d}"
+        candidates = [f"view: exported to {d} (the viewer serves <repo>/output only) · {shot}",
+                      f"view: exported outside <repo>/output (not served by the viewer) · {shot}",
+                      f"view: not served · {shot}"]
+        return next((c for c in candidates if width is None or len(c) <= width), candidates[-1])
     return f"view {report['viewer_url']} · shot: uv run mech shot {name}"
 
 
@@ -1320,15 +1692,18 @@ def _view_line(report: dict) -> str:
 _SUMMARY_PRIORITY = [("FAIL", 1), ("target_miss", 1), ("WARN", 1), ("loops", 1), ("clearance", 1), ("targets", 1),
                      ("dprev", 1),
                      ("FAIL", None), ("target_miss", None), ("WARN", None), ("loads", 1), ("ranges", 1),
-                     ("loads", None), ("INFO", None)]
+                     ("loads", None), ("INFO", None), ("perf", None)]
 _CHECK_PRIORITY = [("FAIL", 1), ("WARN", 1), ("mobility", 1), ("home", 1), ("FAIL", None), ("WARN", None),
                    ("roles", 1), ("INFO", None)]
 
 
 def _fit(tiers: dict[str, list[_Line]], order: list[str], priority: list[tuple[str, int | None]],
-         fixed_top: list[str], fixed_bottom: list[str], budget: int | None) -> list[str]:
+         fixed_top: list[str], fixed_bottom: list[str], budget: int | None,
+         width: int | None = SUMMARY_WIDTH) -> list[str]:
     """Lay out tiers in display ``order``; over budget, keep each tier's first lines by ``priority``
-    (dropping from the bottom of each tier) and add a ``(+N more: …)`` tally line."""
+    (dropping from the bottom of each tier) and add a ``(+N more: …)`` tally line. ``fixed_top``
+    and clippable lines are cut to ``width`` (None = unlimited); ``fixed_bottom`` (the view /
+    next-step line, built to fit) and FAIL/WARN findings never are."""
     total = len(fixed_top) + len(fixed_bottom) + sum(len(v) for v in tiers.values())
     keep = {name: len(lines) for name, lines in tiers.items()}
     dropped: list[_Line] = []
@@ -1344,53 +1719,107 @@ def _fit(tiers: dict[str, list[_Line]], order: list[str], priority: list[tuple[s
             room -= add
         for name, lines in tiers.items():
             dropped += lines[keep[name]:]
-    out = list(fixed_top)
+    out = [_clip(line, width) for line in fixed_top]
     for name in order:
-        out += [line.text for line in tiers.get(name, [])[:keep.get(name, 0)]]
+        out += [_clip(line.text, width) if line.clip else line.text for line in tiers.get(name, [])[:keep.get(name, 0)]]
     if dropped:
         counts: dict[str, int] = {}
         for line in dropped:
             counts[line.tally] = counts.get(line.tally, 0) + 1
         what = ", ".join(f"{n} {t}" for t, n in counts.items())
-        out.append(f"(+{len(dropped)} more: {what} — --verbose)")
+        out.append(_clip(f"(+{len(dropped)} more: {what} — --verbose)", width))
     return out + list(fixed_bottom)
 
 
 def format_summary(report: dict, verbose: bool = False) -> str:
-    """The compact text summary (≤ 15 lines unless ``verbose``); see the module docstring."""
-    budget = None if verbose else SUMMARY_LINES
+    """The compact text summary (≤ 15 lines of ≤ 250 characters unless ``verbose``); see the
+    module docstring and the width notes above ``_Line``."""
+    budget, width = (None, None) if verbose else (SUMMARY_LINES, SUMMARY_WIDTH)
     multi = len(report.get("studies") or []) > 1
     tiers: dict[str, list[_Line]] = {"FAIL": [], "target_miss": [], "WARN": [], "INFO": []}
-    for issue, studies in _dedup(report):
+    grouped = _dedup(report)
+    for issue, studies, alike in _fold_alike(grouped, verbose):
+        if issue["severity"] == "INFO":
+            continue
         tier = "target_miss" if issue["code"] == "target_miss" else issue["severity"]
-        tiers[tier].append(_issue_line(issue, studies, multi))
+        tiers[tier].append(_issue_line(issue, studies, multi, width, alike))
+    tiers["INFO"] = _fold_info([(i, s) for i, s in grouped if i["severity"] == "INFO"], multi, verbose, width)
     if report["status"] == "INVALID":
         n = len(report["issues"])
         header = f"mech {report['name']} — INVALID   {n} error{'s' if n != 1 else ''}"
         footer = "nothing analyzed — fix the errors above and re-run"
-        return "\n".join(_fit(tiers, ["FAIL"], [("FAIL", None)], [header], [footer], budget))
-    tiers["loops"] = [_Line(_loops_line(report), "loop status")]
+        return "\n".join(_fit(tiers, ["FAIL"], [("FAIL", None)], [header], [footer], budget, width))
+    tiers["loops"] = [_Line(_loops_line(report, verbose, width), "loop status")]
     tiers["clearance"] = [_Line(_clearance_line(report), "clearance")]
-    tiers["loads"] = _load_lines(report)
-    for name, tally, text in (("targets", "targets", _targets_line(report)), ("ranges", "ranges", _ranges_line(report)),
-                              ("dprev", "Δprev", _format_delta(report.get("delta_prev"), verbose))):
+    tiers["loads"] = _load_lines(report, verbose)
+    tiers["perf"] = _perf_lines(report) if verbose else []
+    for name, tally, text in (("targets", "targets", _targets_line(report, width, verbose)),
+                              ("ranges", "ranges", _ranges_line(report, verbose, width)),
+                              ("dprev", "Δprev", _format_delta(report.get("delta_prev"), verbose, width))):
         tiers[name] = [_Line(text, tally)] if text else []
-    order = ["FAIL", "target_miss", "WARN", "INFO", "loops", "clearance", "loads", "targets", "ranges", "dprev"]
-    return "\n".join(_fit(tiers, order, _SUMMARY_PRIORITY, [_header(report)], [_view_line(report)], budget))
+    order = ["FAIL", "target_miss", "WARN", "INFO", "loops", "clearance", "loads", "targets", "ranges", "perf", "dprev"]
+    return "\n".join(_fit(tiers, order, _SUMMARY_PRIORITY, [_header(report)], [_view_line(report, width)], budget,
+                          width))
 
 
-def format_check(report: dict, verbose: bool = False) -> str:
-    """Summary for ``mech check``: header, roles, mobility per study, home clearance, issues."""
+_ROLE_ORDER = ("driver", "coupled", "free", "passive", "fixed")
+_ROLES_NAMED = ("driver", "coupled", "free")  # named on a crowded roles line; passive / fixed are counted
+
+
+def _roles_line(report: dict, verbose: bool = False, width: int | None = SUMMARY_WIDTH) -> str | None:
+    """``roles driver j_crank · passive j_coupler, j_rocker`` — the joints grouped by role, drivers
+    first. When that is too wide: the drivers, coupled and free joints by name and the passive and
+    fixed joints counted (``(+29: 6 passive, 23 fixed — --verbose)``), dropping names from the end
+    into that marker if still too wide."""
+    roles = report.get("roles") or {}
+    if not roles:
+        return None
+    order = list(_ROLE_ORDER) + sorted({r for r in roles.values() if r not in _ROLE_ORDER})
+    groups = [(r, [j for j, rr in roles.items() if rr == r]) for r in order]
+    groups = [(r, js) for r, js in groups if js]
+    full = "roles " + _SEP.join(f"{r} {', '.join(js)}" for r, js in groups)
+    if verbose or width is None or len(full) <= width:
+        return full
+    named = [(r, j) for r, js in groups if r in _ROLES_NAMED for j in js]
+    counted = {r: len(js) for r, js in groups if r not in _ROLES_NAMED}
+
+    def render(n: int) -> str:
+        """The first n named joints by name, the rest of them and the passive/fixed ones counted."""
+        bits = [f"{r} {', '.join(j for rr, j in named[:n] if rr == r)}" for r in order
+                if any(rr == r for rr, _ in named[:n])]
+        tail = {r: counted.get(r, 0) + sum(1 for rr, _ in named[n:] if rr == r) for r in order}
+        tail = {r: k for r, k in tail.items() if k}
+        if tail:
+            total = sum(tail.values())
+            bits.append(f"(+{total} {next(iter(tail))} — --verbose)" if len(tail) == 1 else
+                        f"(+{total}: {', '.join(f'{k} {r}' for r, k in tail.items())} — --verbose)")
+        return "roles " + _SEP.join(bits)
+
+    for n in range(len(named), 0, -1):
+        if len(render(n)) <= width:
+            return render(n)
+    return _clip(render(min(1, len(named))), width)
+
+
+def format_check(report: dict, verbose: bool = False, *, command: str | None = None) -> str:
+    """Summary for ``mech check``: header, roles, mobility per study, home clearance, issues.
+    ``command`` is the ``mech run`` command line for the same script and params (the footer's next
+    step, ready to copy); without it the footer names the step only."""
     if report["status"] == "INVALID":
         return format_summary(report, verbose)
-    budget = None if verbose else SUMMARY_LINES
+    budget, width = (None, None) if verbose else (SUMMARY_LINES, SUMMARY_WIDTH)
+    multi = len(report.get("mobility") or {}) > 1
     tiers: dict[str, list[_Line]] = {"FAIL": [], "WARN": [], "INFO": []}
-    for issue, studies in _dedup(report):
-        tiers[issue["severity"]].append(_issue_line(issue, studies, len(report.get("mobility") or {}) > 1))
-    roles = report.get("roles") or {}
-    tiers["roles"] = [_Line("roles " + " · ".join(f"{j} {r}" for j, r in roles.items()), "roles")] if roles else []
+    grouped = _dedup(report)
+    for issue, studies, alike in _fold_alike(grouped, verbose):
+        if issue["severity"] != "INFO":
+            tiers[issue["severity"]].append(_issue_line(issue, studies, multi, width, alike))
+    tiers["INFO"] = _fold_info([(i, s) for i, s in grouped if i["severity"] == "INFO"], multi, verbose, width)
+    roles_text = _roles_line(report, verbose, width)
+    tiers["roles"] = [_Line(roles_text, "roles")] if roles_text else []
     mob = report.get("mobility") or {}
-    tiers["mobility"] = [_Line("studies " + " · ".join(f"{s} mobility {m}" for s, m in mob.items())
+    tiers["mobility"] = [_Line(_join([f"{s} mobility {m}" for s, m in mob.items()], width=width,
+                                     more="more — --verbose", head="studies", keep=1)
                                if mob else "studies none (nothing to drive)", "mobility")]
     hc = report.get("home_min_clearance")
     home = (f"home min clearance {sig(hc['value'])} mm ({'/'.join(hc['parts'])}"
@@ -1398,5 +1827,5 @@ def format_check(report: dict, verbose: bool = False) -> str:
             else "home min clearance: no unjoined pairs within reach")
     tiers["home"] = [_Line(home, "home")]
     order = ["FAIL", "WARN", "INFO", "roles", "mobility", "home"]
-    footer = "next: uv run mech run <script> to run the studies"
-    return "\n".join(_fit(tiers, order, _CHECK_PRIORITY, [_header(report, "mech check")], [footer], budget))
+    footer = f"next: {command} to run the studies" if command else "next: `uv run mech run` the same script to run the studies"
+    return "\n".join(_fit(tiers, order, _CHECK_PRIORITY, [_header(report, "mech check")], [footer], budget, width))

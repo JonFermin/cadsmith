@@ -3,64 +3,28 @@
 Sun z=12 on the motor shaft, three z=18 planets on a carrier, a FIXED internal ring z=48
 (= zs + 2·zp). Each stage reduces 1 + zr/zs = 5:1; the stage-1 carrier carries the stage-2 sun
 and the stage-2 carrier is the output, running in a 6001 bearing in the front plate: 25:1 overall.
-The parts library has no internal gear, so the ring is generated here: two hardened ring-gear
-inserts (one per stage, in an aluminium housing with spacer rings) whose bore is the "virtual"
-external gear with zr teeth — its teeth are the ring's tooth spaces, ISO 53 involute flanks (same
-base circle) from the ring tip circle r − m to its root r + 1.25 m — exactly the conjugate of the
-planets' library involutes. Planet phasing is derived from the sun mesh (gear_pair logic) and the
-ring phase from planet 0; every planet is checked against both meshes before anything is built.
+The ring is `mech.parts.internal_gear` — the exact conjugate of the planets' library involutes,
+its tooth tips trimmed against involute interference with the z=18 planets (`pinion=`) — as two
+hardened inserts (one per stage) pressed into aluminium housing plates, with spacer rings between.
+Planet phasing is derived from the sun mesh (gear_pair logic) and the ring phase from planet 0;
+every planet is checked against both meshes before anything is built.
 
 The axis is world +X (motor at −X, output flange at +X) and horizontal, so a lever with a payload
 on the output flange loads the whole train: the sun holding torque is the output torque / 25.
 With a fixed ring the kinematics are linear in the sun angle, expressed as couplings:
     carrier = sun · zs/(zs+zr)          planet (relative to its carrier) = −(zs/zp)·(zr/(zs+zr)) · sun
 Ring/planet pairs cannot be a gear() mesh (the ring is ground, not a revolute child), so they are
-allow_contact pairs with a 0.02 mm depth budget — any real tooth overlap is still an interference.
+declared `asm.mesh(ring, planet)`: contact allowed, any tooth overlap is still an interference.
 """
 import math
 
 import numpy as np
 from build123d import *
 from mech import *
-from mech.parts import bearing, nema17, socket_head_screw, spur_gear
-
-PA = 20.0  # pressure angle, deg (matches mech.parts.spur_gear)
+from mech.parts import bearing, internal_gear, nema17, socket_head_screw, spur_gear
 
 
-# ------------------------------------------------------------------ internal gear + prism helpers
-def ring_space_outline(module, teeth, backlash, phase_deg, samples=4):
-    """XY polygon of the virtual external gear whose zr teeth are the ring's tooth spaces.
-
-    Involute flanks of the base circle rb = r·cos(PA) from the ring tip circle r − m (the virtual
-    root) to the ring root circle r + 1.25 m (the virtual tip); the ring tooth is thinned by
-    backlash/2 at the pitch circle. Tooth 0 (a ring space) is centered on `phase_deg`.
-    """
-    m, z = module, teeth
-    alpha, r = math.radians(PA), module * teeth / 2
-    rb, r_in, r_out = r * math.cos(alpha), r - m, r + 1.25 * m
-    if r_in <= rb:
-        raise ValueError(f"ring with {z} teeth: tip circle under the base circle (need zr > 2/(1-cos PA))")
-    inv = lambda x: np.tan(x) - x
-    psi = (math.pi * m / 2 + backlash / 2) / (2 * r)                 # space half-angle at the pitch circle
-    t0, t1 = math.sqrt((r_in / rb) ** 2 - 1), math.sqrt((r_out / rb) ** 2 - 1)
-    rho = rb * np.sqrt(1 + np.linspace(t0, t1, samples) ** 2)       # uniform in roll parameter
-    theta = psi + inv(alpha) - inv(np.arccos(rb / rho))
-    if theta[-1] <= 0:
-        raise ValueError(f"ring with {z} teeth: root land vanishes (space is pointed)")
-    pitch = 2 * math.pi / z
-    ang = np.concatenate([-theta, theta[::-1], [pitch / 2]])         # up one flank, down the other, tip land
-    rad = np.concatenate([rho, rho[::-1], [r_in]])
-    pts = []
-    for k in range(z):
-        a = ang + k * pitch + math.radians(phase_deg)
-        pts.extend(zip(rad * np.cos(a), rad * np.sin(a)))
-    return [(float(x), float(y)) for x, y in pts]
-
-
-def _poly(pts):
-    return Wire.make_polygon([(x, y, 0) for x, y in pts], close=True)
-
-
+# ------------------------------------------------------------------ prism helpers
 def _circ(d, x=0.0, y=0.0):
     return Wire([Edge.make_circle(d / 2, Plane(origin=(x, y, 0), z_dir=(0, 0, 1)))])
 
@@ -115,7 +79,7 @@ def planet_spin(report):
 
 
 # ------------------------------------------------------------------------------------ the model
-def build(module=1.0, zs=12, zp=18, n_planets=3, width=8.0, backlash=0.1, ring_backlash=0.2,
+def build(module=1.0, zs=12, zp=18, n_planets=3, width=8.0, backlash=0.1, ring_backlash=0.2, ring_rim=1.5,
           payload_g=2500.0, arm=150.0, capacity=0.4, axis_height=60.0, arm_side=1) -> Assembly:
     m, zr = module, zs + 2 * zp
     if (zs + zr) % n_planets:
@@ -158,15 +122,18 @@ def build(module=1.0, zs=12, zp=18, n_planets=3, width=8.0, backlash=0.1, ring_b
              prism(outer, [_circ(12)] + [_circ(3.4, *h) for h in mot_holes] + [_circ(3, *h) for h in bolt_holes], 2, 2),
              prism(outer, [_circ(12)] + [_circ(6, *h) for h in mot_holes] + [_circ(3, *h) for h in bolt_holes], 4, t_st - 4)]
     asm.part("stand", [W * s for s in stand], ground=True, color="#6f757d", material="aluminum_6061")
-    # housing = a bolted stack: ring-gear plate, spacer, ring-gear plate, spacer (each 0.5 mm off the carriers)
+    # housing = a bolted stack: ring insert in its plate, spacer, ring insert in its plate, spacer
+    # (each 0.5 mm off the carriers); the inserts sit in nominal (pressed) bores of the plates
     rs, holes = rounded_square(side, rad), [_circ(3.4, *h) for h in bolt_holes]
+    d_ring = m * zr + 2.5 * m + 2 * ring_rim                     # internal_gear OD: root circle + rim
     stack = (("ring1", z_h0, z_r1), ("spacer1", z_r1, z_r2), ("ring2", z_r2, z2 + width + 0.5),
              ("spacer2", z2 + width + 0.5, z_h1))
     for name, za, zb in stack:
         if name.startswith("ring"):
-            bore = _poly(ring_space_outline(m, zr, ring_backlash, ring_phase))
-            asm.part(name, W * prism(rs, [bore] + holes, za, zb - za), ground=True, color="#9ea4ab", material="steel",
-                     bom=f"Internal ring gear plate m{m:g} z{zr} x {zb - za:g} mm")
+            ring = Rot(0, 0, ring_phase) * internal_gear(m, zr, zb - za, rim=ring_rim, backlash=ring_backlash, pinion=zp)
+            asm.part(name, W * (Pos(0, 0, za) * ring), ground=True, color="#9ea4ab", material="steel")
+            asm.part(f"housing{name[-1]}", W * prism(rs, [_circ(d_ring)] + holes, za, zb - za), ground=True,
+                     color="#3f6aa6", material="aluminum_6061")
         else:
             asm.part(name, W * prism(rs, [_circ(2 * r_tip_ring + 1)] + holes, za, zb - za), ground=True,
                      color="#3f6aa6", material="aluminum_6061")
@@ -183,7 +150,7 @@ def build(module=1.0, zs=12, zp=18, n_planets=3, width=8.0, backlash=0.1, ring_b
     screws = [Pos(x, y, 4.0) * socket_head_screw("M3", 8) for x, y in mot_holes]  # heads sunk in the stand
     asm.part("motor_screws", [W * s.shape for s in screws], ground=True, color="#1e1e22", material="steel",
              bom="4 x ISO 4762 M3x8 socket head cap screw")
-    asm.ignore("motor_screws", "motor")                          # M3 thread in the motor's 2.5 mm tapped holes
+    asm.fasten("motor_screws", "motor")                          # M3 thread in the motor's 2.5 mm tapped holes
 
     # ---- stage 1: sun on the motor shaft, planets on carrier 1 (which carries sun 2)
     asm.part("sun1", W * (Pos(0, 0, z1) * spur_gear(m, zs, width, bore=5, backlash=backlash)),
@@ -208,7 +175,7 @@ def build(module=1.0, zs=12, zp=18, n_planets=3, width=8.0, backlash=0.1, ring_b
             asm.fix(f"bearing{s}_{k}", f"planet{s}_{k}")
             asm.revolute(f"j_p{s}_{k}", f"carrier{s}", f"planet{s}_{k}", origin=P(*pin_at(phi), zg), axis=X)
             asm.gear(j_in, f"j_p{s}_{k}", k_planet)              # external mesh: this stage's sun / planet
-            asm.allow_contact(f"ring{s}", f"planet{s}_{k}", max_depth=0.02)  # internal mesh ring / planet
+            asm.mesh(f"ring{s}", f"planet{s}_{k}")               # internal mesh: the fixed ring / planet
     asm.part("sun2", W * (Pos(0, 0, z_c1 + t_c1) * spur_gear(m, zs, width + 1, backlash=backlash)),
              material="steel", color="#d9dde2")                  # stage-2 sun, integral with carrier 1
     asm.fix("sun2", "carrier1")

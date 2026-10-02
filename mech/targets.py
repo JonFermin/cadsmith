@@ -3,26 +3,47 @@
 A target states design intent as a metric that must land in [min, max] (bounds compared with a
 1e-9·max(1, |bound|) float-noise allowance). String metrics are evaluated per study on the
 study's *closed* frames (``pose.ok``) — a pose the solver could not close is not a
-configuration of the mechanism, and its loop_open issue is reported separately — and with
-``study=None`` the worst value over all run studies counts. A revolute loop unknown is
-re-wrapped by whole turns across each run of open frames (its value there is a least-squares
-guess that may have drifted by 360°). For the motion-extent metrics (``span``, ``path``,
-``delta``, ``rot``, ``angle``) a study in which the joint/probe/part does not move at all says
-nothing about how far it moves, so such studies are skipped while another study moves it (e.g.
-``span:j_out`` is not 0 just because a second study swings an unrelated arm). ``mass_g`` and
-callables ``f(report_dict) -> float`` are study-independent; a callable's dict carries each
-study's per-frame ``series`` (see ``callable_view``).
+configuration of the mechanism, and its loop_open issue is reported separately. A revolute loop
+unknown is re-wrapped by whole turns across each run of open frames (its value there is a
+least-squares guess that may have drifted by 360°). ``mass_g`` and callables
+``f(report_dict) -> float`` are study-independent; a callable's dict carries each study's
+per-frame ``series`` (see ``callable_view``).
+
+With ``study=None`` the per-study values are combined by what the metric measures
+(``AGGREGATION``):
+
+- motion extents (``span``, ``delta``, ``path``) take the **largest** value over the studies —
+  how far the mechanism can move it. ``span:j_yaw ≥ 270`` asks whether the joint *can* sweep
+  270°, so one study sweeping it answers yes even if another (a pick-and-place cycle) only
+  yaws 120°; ``delta:tip.z ≤ 5`` is a limit on the largest excursion anywhere;
+- positions (``min:``, ``max:``, ``min_dist:``, ``max_dist:``) take the extreme over every study
+  — min of the minima, max of the maxima — the value the metric has over the union of all
+  frames (``max:j ≤ 90`` is a limit anywhere, ``max:j ≥ 90`` "reaches 90° in some study",
+  ``min_dist:a,b ≥ 20`` the closest approach anywhere);
+- ``clearance``, ``load``, ``sf`` and the rotation limits ``rot``/``angle`` keep the **worst**
+  value against the bounds (largest violation, else smallest margin; first study on ties) —
+  safety figures and "stays parallel" limits must hold in every study.
+
+For ``span``/``delta``/``path``/``rot``/``angle`` a study that does not move the joint/probe/part
+at all says nothing about how far it moves, so such studies are skipped while another study
+moves it (``span:j_out`` is not 0 just because a second study swings an unrelated arm).
 
 Partial runs (``report["partial"]``: a ``--study`` filter skipped studies) never guess about the
 studies that did not run: a target of a skipped study, or a ``study=None`` target that no run
 study defines (or moves), or a callable that fails on the partial report, is *not evaluated*
-(``met`` None, left out of the status). A miss on the studies that ran is a real miss — more
-studies can only make the worst value worse.
+(``met`` None, left out of the status). A miss on the studies that ran counts only when a
+skipped study could not have fixed it: a worst-case figure only gets worse, a largest value only
+grows, a smallest value only shrinks — so ``span ≥ X`` short so far, or ``min:j ≤ X`` still
+above X, is reported as not evaluated with the value so far. A callable can't say which studies
+it reads (a reach over every study's series), so its miss on a partial run is never final
+either: not evaluated, with the value so far; a callable that meets its bounds counts as met.
 
 Result rows: ``{"label", "metric", "value", "min", "max", "margin", "met", "severity", "study",
-"worst_study", "error"}`` — ``study`` is the target's declared study, ``worst_study`` where the
-counted value came from, ``margin`` the signed distance to the nearest bound (negative = outside),
+"worst_study", "error"}`` — ``study`` is the target's declared study, ``worst_study`` the study
+whose value counted, ``margin`` the signed distance to the nearest bound (negative = outside),
 ``met`` None when not evaluated, and ``error`` says why ``value`` is undefined or not evaluated.
+``metric`` is the metric string, or ``"callable"`` for a callable (the summary then shows the
+label alone, never a Python ``__name__``).
 """
 
 from __future__ import annotations
@@ -39,12 +60,23 @@ if TYPE_CHECKING:
     from .motion import StudyResult
 
 __all__ = ["evaluate_targets", "metric_name", "callable_view", "closed_runs", "joint_series", "probe_series", "path_length",
-           "rotation_deg", "BOUND_RTOL"]
+           "rotation_deg", "aggregation", "load_scale", "is_zero_load", "BOUND_RTOL", "CALLABLE", "AGGREGATION",
+           "ZERO_LOAD_RTOL", "ZERO_LOAD_ABS"]
 
 BOUND_RTOL = 1e-9  # float-noise allowance on target bounds, relative to max(1, |bound|)
 _STILL = 1e-9  # an extent below this counts as "did not move"
 _AXES = {"x": 0, "y": 1, "z": 2}
 _EXTENT_METRICS = ("span", "path", "delta", "rot", "angle")  # 0 in a study that doesn't move it
+CALLABLE = "callable"  # the ``metric`` of a callable target in result rows
+# How a study=None metric combines its per-study values (module docstring); others: "worst".
+AGGREGATION = {"span": "max", "delta": "max", "path": "max",
+               "max": "max", "max_dist": "max", "min": "min", "min_dist": "min",
+               "clearance": "worst", "load": "worst", "sf": "worst", "rot": "worst", "angle": "worst"}
+# A holding load this small relative to the largest load of the model (or absolutely) is
+# solver round-off (gravity along the axis, a balanced pair) and reads as exactly 0: a 1 mg mass
+# on a 1 mm arm already holds 1e-8 N·m.
+ZERO_LOAD_RTOL = 1e-9
+ZERO_LOAD_ABS = 1e-9
 
 
 class _Undefined(Exception):
@@ -52,8 +84,31 @@ class _Undefined(Exception):
 
 
 def metric_name(metric) -> str:
-    """Display form of a metric: the string itself, or ``name()`` for a callable."""
-    return metric if isinstance(metric, str) else f"{getattr(metric, '__name__', 'callable')}()"
+    """Display form of a metric: the string itself, or ``"callable"`` for a callable (its label
+    names it in the summary; a Python ``__name__`` such as ``<lambda>`` tells the reader nothing)."""
+    return metric if isinstance(metric, str) else CALLABLE
+
+
+def aggregation(metric: str) -> str:
+    """``"max"`` | ``"min"`` | ``"worst"``: how ``metric`` combines per-study values (module docstring)."""
+    return AGGREGATION.get(metric.partition(":")[0].strip(), "worst")
+
+
+def load_scale(loads_by_study) -> float:
+    """The largest defined |load| among ``loads_by_study`` (``{study: {joint: entry}}`` or an
+    iterable of ``{joint: entry}``) — the scale round-off loads are measured against."""
+    entries = loads_by_study.values() if isinstance(loads_by_study, dict) else loads_by_study
+    vals = [abs(float(e["max_abs"])) for ld in entries for e in (ld or {}).values()
+            if isinstance(e, dict) and e.get("max_abs") is not None and math.isfinite(float(e["max_abs"]))]
+    return max(vals, default=0.0)
+
+
+def is_zero_load(max_abs, scale: float) -> bool:
+    """True when ``max_abs`` is 0 or round-off: below ``ZERO_LOAD_RTOL · scale`` or ``ZERO_LOAD_ABS``."""
+    if max_abs is None:
+        return False
+    v = abs(float(max_abs))
+    return v <= max(ZERO_LOAD_RTOL * float(scale or 0.0), ZERO_LOAD_ABS)
 
 
 # ================================================================================================
@@ -164,11 +219,12 @@ def _load(report: dict, res: StudyResult, joint: str, key: str) -> float:
     mx = entry.get("max_abs")
     if mx is None:
         raise _Undefined(f"load of '{joint}' undefined ({entry.get('why') or 'no closed frame'})")
+    zero = is_zero_load(mx, load_scale(s.get("loads") for s in report.get("studies") or []))
     if key == "load":
-        return float(mx)
+        return 0.0 if zero else float(mx)
     if entry.get("capacity") is None:
         raise _Undefined(f"'{joint}' has no actuator capacity")
-    return math.inf if mx == 0 else float(entry["capacity"]) / float(mx)
+    return math.inf if zero else float(entry["capacity"]) / float(mx)
 
 
 def _max_rotation(res: StudyResult, a: str, b: str | None) -> float:
@@ -241,6 +297,26 @@ def _worst(values: list[tuple[str, float]], t: Target) -> tuple[str, float]:
     return max(values, key=lambda sv: (_violation(sv[1], t), -_margin(sv[1], t)))
 
 
+def _pick(values: list[tuple[str, float]], t: Target, how: str) -> tuple[str, float]:
+    """The (study, value) that counts under aggregation ``how`` (first study on ties)."""
+    if how == "max":
+        return max(values, key=lambda sv: sv[1])
+    if how == "min":
+        return min(values, key=lambda sv: sv[1])
+    return _worst(values, t)
+
+
+def _fixable(v: float, t: Target, how: str) -> bool:
+    """Could a study that did not run turn this miss into a met? A ``max`` can still rise above a
+    missed ``min`` bound, a ``min`` still drop below a missed ``max`` bound; a worst-case figure
+    only gets worse."""
+    if how == "max":
+        return t.min is not None and v < t.min
+    if how == "min":
+        return t.max is not None and v > t.max
+    return False
+
+
 def _met(v: float, t: Target) -> bool:
     """Inside [min, max] up to float noise (a value that lands on a bound by construction meets it)."""
     return ((t.min is None or v >= t.min - _slack(t.min))
@@ -299,7 +375,11 @@ def _evaluate(asm: Assembly, report: dict, results: dict[str, StudyResult], t: T
                 _row(t, None, False, None, why)
         if math.isnan(v):
             return _row(t, None, None if skipped else False, None, "callable returned NaN")
-        return _row(t, v, _met(v, t), None, None)
+        met = _met(v, t)
+        if skipped and not met:  # a callable can't say which studies it reads: any of them may repair it
+            return _row(t, v, None, None, f"not evaluated ({not_run}): value so far {fnum(v):g}, a skipped study "
+                                          f"could still change it")
+        return _row(t, v, met, None, None)
     kind = t.metric.partition(":")[0].strip()
     if kind == "mass_g":
         v = float((report.get("mass") or {}).get("total_g") or 0.0)
@@ -324,8 +404,14 @@ def _evaluate(asm: Assembly, report: dict, results: dict[str, StudyResult], t: T
             values = moving
         elif partial:
             return _row(t, None, None, None, f"not evaluated: nothing moves it in the studies run ({not_run})")
-    study, v = _worst(values, t)
-    return _row(t, v, _met(v, t), study, None)
+    how = aggregation(t.metric)
+    study, v = _pick(values, t, how)
+    met = _met(v, t)
+    if partial and not met and _fixable(v, t, how):  # a skipped study could still repair this miss
+        word = "largest" if how == "max" else "smallest"
+        return _row(t, v, None, study, f"not evaluated ({not_run}): {word} value so far {fnum(v):g}, a skipped "
+                                       f"study could still change it")
+    return _row(t, v, met, study, None)
 
 
 def evaluate_targets(asm: Assembly, report: dict, results: dict[str, StudyResult]) -> list[dict]:

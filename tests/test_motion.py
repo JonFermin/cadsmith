@@ -337,3 +337,13 @@ def test_singular_frames_are_listed_and_branch_jumps_use_the_secant():
     jumps = _branch_jumps(kin, ["j_crank"], poses, {8})
     assert (9, "j_rocker") in [(k, j) for k, j, _ in jumps]  # a 30° miss of the secant, though it moved < 20°
     assert _branch_jumps(kin, ["j_crank"], res.poses[:10], {8}) == []
+
+
+def test_run_study_reports_progress_per_frame(four_bar):
+    """progress("solve", done, total) after every solved frame (runner/CLI live progress)."""
+    kin = Kinematics(four_bar)
+    calls = []
+    res = run_study(four_bar, kin, Study("turn", {"j_crank": (0, 90)}, frames=7),
+                    progress=lambda *a: calls.append(a))
+    assert calls == [("solve", k, 7) for k in range(1, 8)] and len(res.poses) == 7
+    assert run_study(four_bar, kin, Study("turn", {"j_crank": (0, 90)}, frames=3)).poses[-1].ok  # optional

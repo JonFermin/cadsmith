@@ -544,3 +544,85 @@ def test_tooth_bearing_parts_are_tagged_and_keep_the_tag_when_moved() -> None:
     assert (Pos(3, 0, 0) * Rot(0, 0, 30) * gp.g2).kind == "gear"
     assert gp.g1.mate("axis", Location((10, 0, 0))).kind == "gear"
     assert nema17().kind is None and bearing("608").kind is None
+    assert parts.internal_gear(1, 48, 6).kind == "gear"
+
+
+# --- internal gear (E2) ----------------------------------------------------------------------------
+
+def test_internal_gear_dimensions_and_validation() -> None:
+    m, z, rim = 1.0, 48, 3.0
+    ring = parts.internal_gear(m, z, 6, rim=rim)
+    lo, hi = bbox(ring)
+    d_out = m * z + 2.5 * m + 2 * rim
+    np.testing.assert_allclose(lo, (-d_out / 2, -d_out / 2, 0), atol=1e-6)
+    np.testing.assert_allclose(hi, (d_out / 2, d_out / 2, 6), atol=1e-6)
+    assert ring.shape.is_valid and len(ring.shape.solids()) == 1
+    r = m * z / 2
+    # a tooth space on +X: the pitch point on +X is open, the one half a pitch over is ring material
+    half = math.pi / z
+    assert not ring.shape.is_inside(Vector(r, 0, 3))
+    assert ring.shape.is_inside(Vector(r * math.cos(half), r * math.sin(half), 3))
+    assert not ring.shape.is_inside(Vector(r - m - 0.05, 0, 3)) and not ring.shape.is_inside(Vector(0, 0, 3))
+    assert frame_pos(ring.frames["axis"]) == pytest.approx((0, 0, 0)) and "Internal gear m1 z48" in ring.bom
+    with pytest.raises(ValueError, match="at least 34 teeth"):
+        parts.internal_gear(1, 30, 6)
+    with pytest.raises(ValueError, match="pinion"):
+        parts.internal_gear(1, 48, 6, pinion=48)
+    with pytest.raises(ValueError, match="interferes"):
+        parts.internal_gear(1, 36, 6, pinion=4)
+    with pytest.raises(ValueError, match="rim"):
+        parts.internal_gear(1, 48, 6, rim=0)
+
+
+def _outline_gap(P: np.ndarray, Q: np.ndarray) -> float:
+    """Smallest distance between two closed 2-D polylines (vertex-to-segment both ways)."""
+    def one_way(V, W):
+        A, B = W, np.roll(W, -1, axis=0)
+        D = B - A
+        t = np.clip(np.einsum("vij,ij->vi", V[:, None, :] - A[None], D) / np.einsum("ij,ij->i", D, D), 0, 1)
+        return float(np.min(np.linalg.norm(V[:, None, :] - (A[None] + t[..., None] * D[None]), axis=2)))
+    return min(one_way(P, Q), one_way(Q, P))
+
+
+def _rolled_outlines(zr: int, zp: int, b: float, th: float, pinion_trim: bool = True):
+    """Ring bore and pinion outlines (2-D, the prisms' sections) with the ring at θ, pinion at θ·zr/zp."""
+    from mech.parts.gears import _gear_outline, _internal_outline, _internal_tip
+
+    m = 1.0
+    ring = np.array(_internal_outline(m, zr, b, 20, _internal_tip(m, zr, 20, zp if pinion_trim else None)))
+    pin = np.array(_gear_outline(m, zp, b, 20))
+
+    def rot(P, deg):
+        c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+        return P @ np.array([[c, s], [-s, c]])
+
+    return rot(ring, th), rot(pin, th * zr / zp) + [m * (zr - zp) / 2, 0.0]
+
+
+@pytest.mark.parametrize("zr, zp, b", [(48, 18, 0.1), (36, 12, 0.05)])
+def test_internal_gear_meshes_a_pinion_rolled_inside_at_the_coupled_ratio(zr, zp, b) -> None:
+    """Fixed centers, ring turning θ and pinion θ·zr/zp the same way: never any common volume, and
+    the flank gap stays the backlash's (b/2)·cos α — polyline tangents/chords may only add a hair."""
+    m, width = 1.0, 6
+    ring = parts.internal_gear(m, zr, width, backlash=b, pinion=zp)
+    pinion = spur_gear(m, zp, width, backlash=b)
+    a = m * (zr - zp) / 2
+    for th in (0.0, 2.0, 7.5, 19.3):
+        r = Rot(0, 0, th) * ring.shape
+        p = Pos(a, 0, 0) * Rot(0, 0, th * zr / zp) * pinion.shape
+        assert common_volume(r, p) == 0, (zr, zp, th)
+    expected = b / 2 * math.cos(math.radians(20))
+    for th in np.linspace(0.0, 360.0 / zr, 13):  # one ring tooth pitch of rolling, on the prisms' outlines
+        gap = _outline_gap(*_rolled_outlines(zr, zp, b, th))
+        assert expected - 1e-4 <= gap <= expected + 0.003, (zr, zp, th, gap)
+    # negative control: the pinion half a tooth off puts tooth on tooth
+    wrong = Pos(a, 0, 0) * Rot(0, 0, 5 * zr / zp + 180 / zp) * pinion.shape
+    assert common_volume(Rot(0, 0, 5) * ring.shape, wrong) > 1.0
+
+
+def test_internal_gear_tip_trim_is_what_keeps_the_backlash() -> None:
+    """With the standard tip circle r − m the ring's tip corners reach under the pinion's base circle
+    (involute interference): the flank gap shrinks well below the backlash; pinion= trims them."""
+    zr, zp, b = 36, 12, 0.05
+    gaps = [_outline_gap(*_rolled_outlines(zr, zp, b, th, pinion_trim=False)) for th in np.linspace(0, 10, 21)]
+    assert min(gaps) < 0.6 * b / 2 * math.cos(math.radians(20))

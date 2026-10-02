@@ -56,7 +56,7 @@ def tdc_phase_error(report) -> float:
 
 
 def build(r=22.0, L=96.0, rho=24.0, l=72.0, bore=40.0, t=6.0, pitch=25.0, capacity=0.25, frames=73) -> Assembly:
-    asm = Assembly("radial_engine", clearance=0.3, pin_tol=8.0)   # pin_tol 8: o12 journals sit in o12 bores
+    asm = Assembly("radial_engine", clearance=0.3)                # the 6001 bores encircle the crank axis: carried
     phi = [72.0 * k for k in range(N_CYL)]                       # cylinder angles from +Z toward +X (deg)
     d = [(math.sin(math.radians(p)), 0.0, math.cos(math.radians(p))) for p in phi]
     C = (0.0, 0.0, r)                                            # crankpin at home
@@ -76,22 +76,21 @@ def build(r=22.0, L=96.0, rho=24.0, l=72.0, bore=40.0, t=6.0, pitch=25.0, capaci
     s_top = r + L + 16 + 2                                       # barrel top: master crown at TDC + 2 mm squish
     cyl_rot = [Rot(0, p, 0) for p in phi]                        # +Z -> cylinder axis d_k
 
-    # --- ground: crankcase ring with 5 pads; nose and rear covers as their own parts (ground pairs
-    #     are checked once at home, and the moving parts are swept against the simple ring only)
+    # --- ground: crankcase ring with 5 pads; nose and rear covers (with the 6001 seats) bolt on
     case = yring(R_out, R_in, -yc, yc)
     for Rk in cyl_rot:
         case += Rk * ring(27, 0, R_in, pad) & Box(400, 2 * yc, 400)                   # pad, flats at the ring faces
-        case -= Rk * ring(Rb_o + 0.1, 0, R_in - 6, pad + 1)                            # spigot bore
+        case -= Rk * ring(Rb_o, 0, R_in - 6, pad + 1)                                  # spigot bore (nominal)
     asm.part("crankcase", case, material="aluminum_6061", ground=True, color=COL["case"], opacity=0.45)
-    nose = yring(R_out, 8, -yc - 6, -yc) + yring(22, 8, -32, -yc - 6) + yring(22, 14.1, -48, -32)  # + 6001 seat
-    rear = yring(R_out, 8, yc, yc + 6) + yring(22, 8, yc + 6, 32) + yring(22, 14.1, 32, 46)
+    nose = yring(R_out, 8, -yc - 6, -yc) + yring(22, 8, -32, -yc - 6) + yring(22, 14, -48, -32)    # + 6001 seat
+    rear = yring(R_out, 8, yc, yc + 6) + yring(22, 8, yc + 6, 32) + yring(22, 14, 32, 46)
     asm.part("nose_case", nose, material="aluminum_6061", ground=True, color=COL["case"], opacity=0.45)
     asm.part("rear_case", rear, material="aluminum_6061", ground=True, color=COL["case"], opacity=0.45)
     asm.part("bearing_f", Pos(0, -36, 0) * Rot(-90, 0, 0) * bearing("6001"), ground=True)
     asm.part("bearing_r", Pos(0, 36, 0) * Rot(-90, 0, 0) * bearing("6001"), ground=True)
     # barrels (translucent liners), heads, and all cooling fins as one ground part per cylinder
     for k, Rk in enumerate(cyl_rot):
-        liner = [ring(Rb_o, Rb_i, spig, s_top), ring(29, Rb_o, pad + 0.1, pad + 4.1)]    # liner + hold-down flange
+        liner = [ring(Rb_o, Rb_i, spig, s_top), ring(29, Rb_o, pad, pad + 4)]            # liner + flange on the pad
         asm.part(f"barrel{k}", [Rk * s for s in liner], material="steel", ground=True,
                  color=COL["barrel"], opacity=0.35)
         head = [ring(Rb_o + 1, 0, s_top, s_top + 16), Pos(0, 0, s_top + 22) * Box(34, 22, 12),  # head + rocker box
@@ -101,7 +100,7 @@ def build(r=22.0, L=96.0, rho=24.0, l=72.0, bore=40.0, t=6.0, pitch=25.0, capaci
         fins += [ring(34, Rb_o + 1, s_top + z, s_top + z + 1.5) for z in (2, 6, 10, 14)]
         asm.part(f"fins{k}", [Rk * s for s in fins], material="aluminum_6061", ground=True,
                  color=COL["barrel"], opacity=0.35)
-        hw = [Pos(26.5 * math.cos(a), 26.5 * math.sin(a), pad + 4.1) * hex_nut("M3").shape       # hold-down nuts
+        hw = [Pos(26.5 * math.cos(a), 26.5 * math.sin(a), pad + 4) * hex_nut("M3").shape         # hold-down nuts
               for a in (math.radians(45 + 90 * i) for i in range(4))]
         hw += [Pos(sx * 20, -31, 0) * ring(2.2, 0, pad + 2, s_top + 20) for sx in (-1, 1)]       # pushrod tubes
         asm.part(f"hw{k}", [Rk * s for s in hw], material="steel", ground=True, color=COL["hw"])
@@ -153,13 +152,9 @@ def build(r=22.0, L=96.0, rho=24.0, l=72.0, bore=40.0, t=6.0, pitch=25.0, capaci
         asm.fix(f"wpin{k}", f"piston{k}")
         asm.prismatic(f"j_pist{k}", "crankcase", f"piston{k}", origin=P[k], axis=d[k], home=s)
         asm.pin(f"p_wrist{k}", rod_k, f"piston{k}", point=P[k], axis=Y)
-        asm.allow_contact(f"piston{k}", f"barrel{k}", max_depth=None)                   # piston rides its bore
-        for inside in (f"piston{k}", f"wpin{k}", rod_k):                               # the liner wall is between
-            asm.ignore(f"fins{k}", inside)                                              # them and the fins/hardware
-            asm.ignore(f"hw{k}", inside)
         asm.probe(f"wrist{k}", part=f"piston{k}", point=P[k])
-    asm.allow_contact("crank", "bearing_f", max_depth=None)                             # journals in the 6001s
-    asm.allow_contact("crank", "bearing_r", max_depth=None)
+    # Nominal fits — a piston in its bore, the crank journals in their 6001s — need no declaration:
+    # the joints carry them (any overlap is still an interference).
 
     # --- intent
     asm.actuator("j_crank", capacity=capacity)                                          # hand-propping torque, N*m

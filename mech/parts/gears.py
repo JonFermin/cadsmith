@@ -1,4 +1,4 @@
-"""Involute spur gears, gear pairs, racks and GT2 pulleys (own generator — no bd_warehouse).
+"""Involute spur gears, internal gears, gear pairs, racks and GT2 pulleys (own generator — no bd_warehouse).
 
 Teeth follow the ISO 53 basic rack (addendum m, dedendum 1.25 m). Each flank is the involute from
 the form circle to the tip; below it the flank follows whichever cuts deeper of the involute
@@ -16,7 +16,7 @@ from typing import NamedTuple
 import numpy as np
 from build123d import Location, Rot
 
-from ._build import assemble, prism, tube, z_frame
+from ._build import assemble, disk, prism, tube, z_frame
 from .libpart import LibPart
 
 _ADDENDUM = 1.0          # x module (ISO 53 profile A)
@@ -134,6 +134,112 @@ def spur_gear(module: float, teeth: int, width: float, *, bore: float = 0, backl
     bom = f"Spur gear m{module:g} z{teeth} x {width:g} mm, {pressure_angle:g} deg PA"
     if bore > 0:
         bom += f", bore {bore:g}"
+    return LibPart(shape, bom, None, {"axis": z_frame()}, kind="gear")
+
+
+def _internal_outline(module: float, teeth: int, backlash: float, pressure_angle: float, r_tip: float,
+                      samples: int = 9) -> list[tuple[float, float]]:
+    """Bore polygon of an internal gear: its tooth spaces, a space centered on +X.
+
+    Each space is the tooth of a "virtual" external gear: involute flanks of the base circle
+    rb = r·cos α from the ring's tip circle ``r_tip`` up to its root circle r + 1.25 m (the
+    conjugate of the mating pinion's involutes); the ring's teeth are thinned by backlash/2 at the
+    pitch circle. The flanks are convex toward the space, so the polygon uses the tangent lines at
+    the samples (vertices where consecutive tangents meet): it lies in the ring material, never in
+    the space — chords would bulge the ring's flanks into the pinion.
+    """
+    m, z = module, teeth
+    alpha, r = math.radians(pressure_angle), module * teeth / 2
+    rb, r_root = r * math.cos(alpha), r + _DEDENDUM * m
+    psi = (math.pi * m / 2 + backlash / 2) / (2 * r)          # space half-angle at the pitch circle
+    t0, t1 = math.sqrt((r_tip / rb) ** 2 - 1), math.sqrt((r_root / rb) ** 2 - 1)
+    rho = rb * np.sqrt(1 + np.linspace(t0, t1, samples) ** 2)  # uniform in roll parameter
+    a_rho = np.arccos(rb / rho)
+    theta = psi + _inv(alpha) - _inv(a_rho)                   # space half-angle at radius rho
+    if theta[-1] <= 0:
+        raise ValueError(f"internal_gear: {teeth} teeth at {pressure_angle}° gives pointed spaces")
+    # the flank at +theta, as points and tangent directions (dθ/dρ = −tan(α_ρ)/ρ)
+    pts = np.column_stack([rho * np.cos(theta), rho * np.sin(theta)])
+    tan = np.column_stack([np.cos(theta) + np.sin(theta) * np.tan(a_rho),
+                           np.sin(theta) - np.cos(theta) * np.tan(a_rho)])
+    flank = [pts[0]]
+    for k in range(samples - 1):  # where the tangents at samples k and k+1 meet
+        p, q, u, v = pts[k], pts[k + 1], tan[k], tan[k + 1]
+        det = u[0] * -v[1] + v[0] * u[1]
+        s = ((q[0] - p[0]) * -v[1] + v[0] * (q[1] - p[1])) / det
+        flank.append(p + s * u)
+    flank.append(pts[-1])
+    upper = np.array(flank)                                    # tip circle -> root circle, +theta side
+    lower = upper * [1.0, -1.0]                                # mirror: the −theta flank
+    pitch = 2 * math.pi / teeth
+    # the ring tooth's tip land, θ0 … pitch − θ0 on the tip circle: tangent segments at its ends and
+    # middle (outside the circle, so the land's corners never stand proud of the tip circle)
+    half = (pitch - 2 * theta[0]) / 4
+    land = r_tip / math.cos(half) * np.array([[math.cos(a), math.sin(a)]
+                                               for a in (theta[0] + half, pitch - theta[0] - half)])
+    # one space: up the −θ flank, across the space bottom, down the +θ flank, then the land
+    one = np.vstack([lower, upper[::-1], land])
+    out = []
+    for k in range(teeth):
+        c, s_ = math.cos(k * pitch), math.sin(k * pitch)
+        out.extend((float(c * x - s_ * y), float(s_ * x + c * y)) for x, y in one)
+    return out
+
+
+def _internal_tip(m: float, z: int, pressure_angle: float, pinion: int | None) -> float:
+    """Tip-circle radius of an internal gear: r − m, raised to clear a ``pinion``'s base circle."""
+    alpha = math.radians(pressure_angle)
+    r = m * z / 2
+    rb = r * math.cos(alpha)
+    if r - _ADDENDUM * m <= rb:
+        need = math.floor(2 * _ADDENDUM / (1 - math.cos(alpha))) + 1
+        raise ValueError(f"internal_gear: {z} teeth puts the tip circle inside the base circle at "
+                         f"{pressure_angle:g}° — need at least {need} teeth")
+    r_tip = r - _ADDENDUM * m
+    if pinion is not None:
+        zp = int(pinion)
+        if not 4 <= zp < z:
+            raise ValueError(f"internal_gear: pinion must have 4…{z - 1} teeth (got {pinion})")
+        limit = math.hypot(rb, m * (z - zp) / 2 * math.sin(alpha)) + 0.02 * m
+        if limit >= r - 0.25 * m:
+            raise ValueError(f"internal_gear: a {zp}-tooth pinion interferes with a {z}-tooth ring "
+                             f"(involute interference) — use more ring teeth or a bigger pinion")
+        r_tip = max(r_tip, limit)
+    return r_tip
+
+
+def internal_gear(module: float, teeth: int, width: float, *, rim: float | None = None,
+                  backlash: float = 0.05, pressure_angle: float = 20, pinion: int | None = None) -> LibPart:
+    """Internal (ring) spur gear: axis +Z through the origin, bottom face at z=0, a tooth *space*
+    centered on +X; outer diameter m·teeth + 2.5·m + 2·rim (``rim`` default 2.5·m).
+
+    The teeth are the exact conjugates of ``spur_gear`` involutes (same module and pressure
+    angle), thinned by backlash/2 at the pitch circle like ``spur_gear``'s. A pinion with
+    ``z`` teeth placed at ``Pos(m·(teeth − z)/2, 0, 0) * spur_gear(m, z, …)`` (tooth on +X) meshes
+    at home; with both centers fixed, the ring turning θ turns the pinion θ·teeth/z the same way
+    (``Assembly.gear(ring_joint, pinion_joint, teeth / z)``), and in a planetary set with a fixed
+    ring use ``Assembly.mesh(ring, planet)``.
+
+    ``pinion`` (the mating gear's tooth count) trims the ring's tooth tips against involute
+    interference: a standard tip circle r − m reaches inside the pinion's base circle when
+    r − m < √(rb² + (a·sin α)²) (a = m·(teeth − pinion)/2), where the ring's tip corners would cut
+    the pinion's non-involute root flank; the tips are cut back to that circle (+0.02·m). Without
+    it the tip circle stays at r − m. Needs teeth > 2/(1 − cos α) (≥ 34 at 20°) so the involute
+    reaches the tip circle; keep teeth − pinion ≳ 10 against tip-to-tip interference. Frame
+    ``"axis"`` at the origin; tagged ``kind="gear"``.
+    """
+    m, z = float(module), int(teeth)
+    if not (m > 0 and width > 0):
+        raise ValueError("internal_gear: module and width must be > 0")
+    rim = 2.5 * m if rim is None else float(rim)
+    if rim <= 0:
+        raise ValueError(f"internal_gear: rim must be > 0 (got {rim})")
+    if backlash < 0:
+        raise ValueError(f"internal_gear: backlash must be >= 0 (got {backlash})")
+    bore = _internal_outline(m, z, backlash, pressure_angle, _internal_tip(m, z, pressure_angle, pinion))
+    d_out = m * z + 2 * _DEDENDUM * m + 2 * rim
+    shape = assemble(disk(d_out, width, holes=[bore]))
+    bom = f"Internal gear m{m:g} z{z} x {width:g} mm, {pressure_angle:g} deg PA, OD {d_out:g}"
     return LibPart(shape, bom, None, {"axis": z_frame()}, kind="gear")
 
 

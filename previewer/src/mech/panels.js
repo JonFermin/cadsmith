@@ -65,8 +65,9 @@ export function buildTopbar(app, slug, mechs) {
       m: slug,
       study: s.si === null ? null : model.studies[s.si].name,
       frame: s.frame === null ? 'home' : s.frame,
-      hide: [...s.hidden], isolate: [...s.isolate], section: s.section, explode: s.explode,
-      axes: s.axes, view: s.view, ghost: s.ghost, layout: s.layout,
+      issue: s.issue, hide: [...s.hidden], isolate: [...s.isolate], focus: s.focus, section: s.section,
+      explode: s.explode, axes: s.axes, view: s.view, ghost: s.ghost, layout: s.layout,
+      paths: s.probes ? (s.framePaths || null) : false, zoom: s.zoom,
     });
     const url = `${location.origin}${location.pathname}?${q}`;
     try {

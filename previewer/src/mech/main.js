@@ -125,8 +125,8 @@ async function main() {
   viewer.start(dt => app.tick(dt));
   await nextFrame();
   await nextFrame();
+  window.__mech = app; // debugging / test handle, set before the ready flag
   if (window.__mechError === undefined) window.__mechReady = true;
-  window.__mech = app; // debugging handle
 }
 
 main().catch(fail);

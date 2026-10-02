@@ -13,8 +13,10 @@ platform hangs from rod 1a through a second U (swing, stud spin). The other five
 spatial loops with ball pins at the platform studs: 15 passive unknowns, 15 equations, mobility 0.
 
 A ball joint built from a stud and two revolutes leaves its outer pair (arm ↔ rod) two joints
-apart, beyond mech's `joined` exemption, although the stud neck swinging inside the socket ring is
-the design condition; those pairs are declared `allow_contact` (overlap is still an error).
+apart, so no single joint carries it, although the stud neck swinging inside the socket ring is
+the design condition; those pairs are declared `asm.joined` (exempt from clearance, any overlap is
+still an error). Every nominal fit a joint or pin itself carries (ball in its ring, shaft in its
+bore, a stud spinning in its seat) needs no declaration.
 
 The motors follow the closed-form delta IK so the tool traces a pick-and-place loop and a circle;
 `DeltaKin.fk` (three-sphere intersection) checks mech's loop solution independently.
@@ -55,10 +57,9 @@ def sphere(p, r):
     return Pos(*map(float, p)) * Sphere(r)
 
 
-def stud(center, neck_dir, rb, short=0.0):
-    """Ball stud: ball of radius rb with an M3 neck toward the bar it grows from. A stud modelled
-    as its own part (a U-joint knuckle) stops `short` of the bar face so the two never overlap."""
-    return sphere(center, rb) + cyl(center, neck_dir, 1.5, 0, NECK - short)
+def stud(center, neck_dir, rb):
+    """Ball stud: ball of radius rb with an M3 neck down to the face of the bar it grows from."""
+    return sphere(center, rb) + cyl(center, neck_dir, 1.5, 0, NECK)
 
 
 def socket_shell(center, axis, boss_dir, rb, rod_r):
@@ -154,7 +155,7 @@ def build(r_base=100.0, l_arm=100.0, l_rod=240.0, r_plat=40.0, w=50.0, theta0=30
           rod_d=8.0, reach=80.0, z_pick=-280.0, z_travel=-230.0, y_return=55.0, circle_r=70.0,
           circle_z=-255.0, lift=(5.0, 70.0), payload_g=100.0, capacity=0.55, clearance=1.0) -> Assembly:
     kin = DeltaKin(r_base, l_arm, l_rod, r_plat)
-    asm = Assembly("delta_robot", clearance=clearance, pin_tol=12.0)   # 12: bearing housings carry the arm shafts
+    asm = Assembly("delta_robot", clearance=clearance)             # bearings and housings encircle the arm shafts
     rb, rr = ball_d / 2, rod_d / 2
     E0 = kin.fk([theta0] * 3)                                     # platform centre at home
     zE = float(E0[2])
@@ -166,7 +167,7 @@ def build(r_base=100.0, l_arm=100.0, l_rod=240.0, r_plat=40.0, w=50.0, theta0=30
     asm.part("plate", Pos(0, 0, 25) * extrude(ring, 8), ground=True, material="aluminum_6061", color=STEEL)
     for i, u, t, A, P in legs:
         B = r_base * u                                            # motor shaft axis point
-        for name, tc, th, bore in ((f"bracket_{i}", -10.0, 4.0, 11.5), (f"support_{i}", 17.5, 7.0, 11.05)):
+        for name, tc, th, bore in ((f"bracket_{i}", -10.0, 4.0, 11.5), (f"support_{i}", 17.5, 7.0, 11.0)):
             plate_side = loc_at(B + tc * t + (0, 0, -0.5), t, u) * Box(50, 51, th)   # z −26 … 25, meets the plate
             asm.part(name, plate_side - cyl(B, t, bore, tc - th, tc + th), ground=True,
                      material="aluminum_6061", color=STEEL)
@@ -186,7 +187,6 @@ def build(r_base=100.0, l_arm=100.0, l_rod=240.0, r_plat=40.0, w=50.0, theta0=30
     asm.probe("tcp", part="platform", point=tuple(E0))
 
     # ---- legs
-    fits: list[tuple[str, str]] = []
     for i, u, t, A, P in legs:
         B = r_base * u
         d, a2 = unit(P - A), unit(np.cross(t, P - A))             # rod direction, socket swing axis
@@ -199,41 +199,32 @@ def build(r_base=100.0, l_arm=100.0, l_rod=240.0, r_plat=40.0, w=50.0, theta0=30
         asm.part(f"arm_{i}", arm, material="aluminum_6061", color=ORANGE)
         asm.revolute(f"j_arm_{i}", f"motor_{i}", f"arm_{i}", at=motor.frames["shaft"], home=theta0)
         asm.actuator(f"j_arm_{i}", capacity=capacity)
-        fits += [(f"motor_{i}", f"arm_{i}"), (f"bearing_{i}", f"arm_{i}")]   # ø5 shaft in the hub, stub in the 608
         for s, tag in ((1, "a"), (-1, "b")):
             As, Ps, neck = A + s * w / 2 * t, P + s * w / 2 * t, -s * t
             rod, hi, lo = f"rod_{i}{tag}", f"stud_{i}{tag}", f"stud_{i}{tag}_lo"
-            asm.part(hi, stud(As, neck, rb, short=0.1), material="steel", color=CHROME)
+            asm.part(hi, stud(As, neck, rb), material="steel", color=CHROME)
             asm.revolute(f"j_stud_{i}{tag}", f"arm_{i}", hi, origin=As, axis=t)
-            fits += [(f"arm_{i}", hi), (rod, lo)]                 # stud spin faces, ball in the lower ring
-            asm.allow_contact(f"arm_{i}", rod, max_depth=0.05)    # stud neck swings inside the upper ring
             if (i, tag) == (1, "a"):                              # tree path to the platform
-                sock = socket_shell(As, t, d, rb, rr) - socket_bore(As, t, rb) - cyl(As, d, rr + 0.1, 0, BOSS + 0.1)
+                sock = socket_shell(As, t, d, rb, rr) - socket_bore(As, t, rb) - cyl(As, d, rr, 0, BOSS + 0.1)
                 asm.part("socket_1a", sock, material="carbon_fiber", color=CARBON)
                 asm.revolute("j_swing_1a", hi, "socket_1a", origin=As, axis=a2)
                 body = cyl(As, d, rr, 6.5, l_rod) + socket_shell(Ps, t, -d, rb, rr) - socket_bore(Ps, t, rb)
                 asm.part(rod, body, material="carbon_fiber", color=CARBON)
                 asm.revolute("j_spin_1a", "socket_1a", rod, origin=As, axis=d)   # 3rd axis of the ball
-                asm.part(lo, stud(Ps, neck, rb, short=0.1), material="steel", color=CHROME)
+                asm.part(lo, stud(Ps, neck, rb), material="steel", color=CHROME)
                 asm.revolute("j_swing_1a_lo", rod, lo, origin=Ps, axis=a2)
                 asm.revolute("j_stud_1a_lo", lo, "platform", origin=Ps, axis=t)
-                asm.allow_contact("arm_1", "socket_1a", max_depth=0.05)
-                asm.allow_contact("platform", rod, max_depth=0.05)
-                fits += [(hi, "socket_1a"), ("socket_1a", rod), (lo, "platform")]
+                asm.joined("arm_1", "socket_1a")                  # the U-joints' outer pairs
+                asm.joined("platform", rod)
             else:
                 body = (cyl(As, d, rr, 0, l_rod) + socket_shell(As, t, d, rb, rr) + socket_shell(Ps, t, -d, rb, rr)
                         - socket_bore(As, t, rb) - socket_bore(Ps, t, rb))
                 asm.part(rod, body, material="carbon_fiber", color=CARBON)
                 asm.revolute(f"j_swing_{i}{tag}", hi, rod, origin=As, axis=a2)
+                asm.joined(f"arm_{i}", rod)                       # stud neck swings inside the upper ring
                 asm.part(lo, stud(Ps, neck, rb), material="steel", color=CHROME)
                 asm.fix(lo, "platform")
-                asm.pin(f"p_{i}{tag}", rod, "platform", point=Ps)   # ball joint: point only, no axis
-                fits.append((hi, rod))                            # ball in the upper ring
-    # Running fits the joints themselves hold (ball in its ring, shaft in its bore, a stud spinning
-    # on its own axis): the overlap boolean is skipped — the proximity prefilter cannot clear fits
-    # under ~0.5 mm, and these pairs are checked for interference by construction, not by sweep.
-    for a, b in fits:
-        asm.allow_contact(a, b, max_depth=None)
+                asm.pin(f"p_{i}{tag}", rod, lo, point=Ps)            # ball joint: point only, no axis
 
     # ---- intent: IK-driven paths, a pure lift, and the requirements
     pp = lambda u: pick_place(u, reach, z_pick, z_travel, y_return)

@@ -10,6 +10,21 @@ from build123d import Box, Cylinder, Pos
 from mech import Assembly
 from mech.geom import circle_intersect, link
 
+
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", default=False,
+                     help="also run tests marked slow (full showcase analyses; same as -m slow)")
+
+
+def pytest_collection_modifyitems(config, items):
+    """``slow`` tests are skipped unless ``--runslow`` is given or ``-m`` selects them."""
+    if config.getoption("--runslow") or "slow" in (config.getoption("-m") or ""):
+        return
+    skip = pytest.mark.skip(reason="slow: run with --runslow or -m slow")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip)
+
 FOUR_BAR = dict(ground=100.0, crank=40.0, coupler=90.0, rocker=80.0, t=5.0)
 FOUR_BAR_LINKS = {k: v for k, v in FOUR_BAR.items() if k != "t"}  # link lengths only
 SLIDER_CRANK = dict(r=30.0, l=90.0, t=5.0)

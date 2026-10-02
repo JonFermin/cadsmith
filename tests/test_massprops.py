@@ -149,3 +149,17 @@ def test_solid_body_is_fused_cached_and_drops_non_solids():
     assert solid_body(Plane.XY * Rectangle(10, 10)) is None
     mixed = Compound([Box(10, 10, 10), Pos(0, 0, 20) * (Plane.XY * Rectangle(10, 10)).face()])
     assert solid_body(mixed).volume == pytest.approx(1000.0, rel=1e-9) and len(solid_body(mixed).faces()) == 6
+
+
+def test_virtual_parts_are_massless_and_left_out():
+    """The knuckles of a ball() joint weigh nothing and don't enter the assembly's properties."""
+    asm = steel_box_asm(Pos(0, 0, 0))
+    asm.part("arm", Pos(0, 0, 40) * Box(A, B, C), material="steel")
+    asm.ball("b", "box0", "arm", (0, 0, 20))
+    knuckle = asm.parts["b_k1"]
+    assert knuckle.virtual
+    mp = part_props(knuckle)
+    assert (mp.mass_kg, mp.volume_mm3) == (0.0, 0.0) and np.all(mp.inertia == 0)
+    np.testing.assert_allclose(mp.com, (0, 0, 20), atol=1e-9)
+    total = assembly_props(asm)
+    assert total.mass_kg == pytest.approx(2 * M_BOX, rel=1e-9) and total.volume_mm3 == pytest.approx(2 * A * B * C)

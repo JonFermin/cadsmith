@@ -16,7 +16,7 @@ import math
 import numpy as np
 from build123d import *
 from mech import *
-from mech.geom import link
+from mech.geom import link, polygon
 from mech.parts import bearing, gt2_pulley, nema17, rod, sg90, socket_head_screw
 
 HINGE = (0, -1, 0)                          # arm hinge axis: right-hand about -Y raises the link
@@ -40,14 +40,6 @@ def xz_part(sketch, y0, y1):
     return plane.location * extrude(sketch, y1 - y0)
 
 
-def polygon(*pts):
-    """Polygon through 2D points, forced counter-clockwise (a clockwise one has a flipped normal
-    and neither fuses with circles nor extrudes in the sketch direction)."""
-    pts = [(float(x), float(y)) for x, y in pts]
-    area2 = sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]))
-    return Polygon(*(pts if area2 > 0 else pts[::-1]), align=None)
-
-
 def disc(p, r):
     return Pos(float(p[0]), float(p[1])) * Circle(r)
 
@@ -67,7 +59,7 @@ def belt_band(p1, r1, p2, r2, n, width, t_in=0.75, t_out=0.63):
         s = (b - a) / d
         c = math.sqrt(1 - s * s)
         q1, q2 = (-a * s, a * c), (d - b * s, b * c)
-        return Circle(a) + Pos(d, 0) * Circle(b) + polygon(q1, (q1[0], -q1[1]), (q2[0], -q2[1]), q2)
+        return Circle(a) + Pos(d, 0) * Circle(b) + polygon([q1, (q1[0], -q1[1]), (q2[0], -q2[1]), q2])
 
     sk = hull(r1 + t_out, r2 + t_out) - hull(r1 - t_in, r2 - t_in)
     plane = Plane(origin=tuple(p1), x_dir=tuple((p2 - p1) / d), z_dir=tuple(n))
@@ -89,7 +81,7 @@ def tool_low(report) -> float:
 def build(L1=150.0, L2=160.0, a=40.0, b=35.0, th1=65.0, th2=-25.0, zS=115.0, t=5.0,
           belt_cd=72.5, phi_s=262.0, phi_e=220.0, payload_g=200.0,
           nema_nm=0.4, roll_nm=0.176) -> Assembly:
-    asm = Assembly("desktop_arm", clearance=0.3, pin_tol=8.0)   # the 6002 bores (r 7.5) carry the hubs
+    asm = Assembly("desktop_arm", clearance=0.3)                # the 6002 bores encircle the hubs: carried
     # ---- planar linkage geometry in (x, z) at the home pose -------------------------------------
     c1, s1 = math.cos(math.radians(th1)), math.sin(math.radians(th1))
     c2, s2 = math.cos(math.radians(th2)), math.sin(math.radians(th2))
@@ -131,7 +123,7 @@ def build(L1=150.0, L2=160.0, a=40.0, b=35.0, th1=65.0, th2=-25.0, zS=115.0, t=5
     asm.part("yaw_pulley", Pos(0, 0, 3) * gt2_pulley(80, 6, 8), material="aluminum_6061", color="#c7c7c7")
     turntable = Pos(0, 0, 17) * Cylinder(80, 6) + Pos(0, 0, 12.75) * Cylinder(10, 2.5) - Cylinder(4, 40)
     asm.part("turntable", turntable, material="aluminum_6061", color="#a8adb5")
-    asm.part("yaw_pinion", Pos(-belt_cd, 0, 3) * gt2_pulley(20, 6, 5.1), material="aluminum_6061", color="#c7c7c7")
+    asm.part("yaw_pinion", Pos(-belt_cd, 0, 3) * gt2_pulley(20, 6, 5), material="aluminum_6061", color="#c7c7c7")
     asm.revolute("j_yaw", "base", "yaw_shaft", origin=(0, 0, 0), axis=(0, 0, 1), limits=(-135, 135))
     asm.revolute("j_yaw_motor", "yaw_motor", "yaw_pinion", at=yaw_motor.frames["shaft"], limits=(-540, 540))
     asm.belt("j_yaw_motor", "j_yaw", 20, 80)
@@ -139,7 +131,7 @@ def build(L1=150.0, L2=160.0, a=40.0, b=35.0, th1=65.0, th2=-25.0, zS=115.0, t=5
         asm.fix(p, "yaw_shaft")
 
     # ---- tower on the turntable: yoke plates with hub bearings, two motors inside, belts outside -
-    plate = (polygon((-74, 20), (18, 20), (18, 55), (26, zS - 15), (-30, zS + 21), (-74, zS - 35))
+    plate = (polygon([(-74, 20), (18, 20), (18, 55), (26, zS - 15), (-30, zS + 21), (-74, zS - 35)])
              + disc(S, 30) + disc(Me, 31) + disc(F, 10) - disc(S, 16))
     asm.part("plate_r", xz_part(plate - disc(Ms, 11.25), yPl, yPl + tp), material="aluminum_6061", color="#a8adb5")
     asm.part("plate_l", xz_part(plate - disc(Me, 11.25), -yPl - tp, -yPl), material="aluminum_6061", color="#a8adb5")
@@ -154,8 +146,8 @@ def build(L1=150.0, L2=160.0, a=40.0, b=35.0, th1=65.0, th2=-25.0, zS=115.0, t=5
     asm.part("post_F", ycyl(F, yL - t / 2 - 0.5, yPl, 2.5) + ycyl(F, yL + t / 2 + 0.5, yPl, 5), material="steel")
     for p in ("plate_r", "plate_l", "bearing_s", "bearing_e", "shoulder_motor", "elbow_motor", "belt_s", "belt_e", "post_F"):
         asm.fix(p, "turntable")
-    asm.part("pinion_s", along_y(Ms, yP, gt2_pulley(20, 6, 5.1)), material="aluminum_6061", color="#c7c7c7")
-    asm.part("pinion_e", along_y(Me, -yP - 8, gt2_pulley(20, 6, 5.1)), material="aluminum_6061", color="#c7c7c7")
+    asm.part("pinion_s", along_y(Ms, yP, gt2_pulley(20, 6, 5)), material="aluminum_6061", color="#c7c7c7")
+    asm.part("pinion_e", along_y(Me, -yP - 8, gt2_pulley(20, 6, 5)), material="aluminum_6061", color="#c7c7c7")
     asm.revolute("j_shoulder_motor", "shoulder_motor", "pinion_s", origin=P(Ms), axis=HINGE)
     asm.revolute("j_elbow_motor", "elbow_motor", "pinion_e", origin=P(Me), axis=HINGE)
 
@@ -178,13 +170,11 @@ def build(L1=150.0, L2=160.0, a=40.0, b=35.0, th1=65.0, th2=-25.0, zS=115.0, t=5
     asm.pin("p_D", "drive_rod", "forearm", point=P(D), axis=HINGE)         # closes S-C-D-E
     asm.belt("j_shoulder_motor", "j_shoulder", 20, 80)
     asm.belt("j_elbow_motor", "j_elbow", 20, 80)
-    for p in ("crank", "pulley_e"):                                        # bushing on the arm's shaft
-        asm.allow_contact(p, "shoulder_shaft", max_depth=None)
-    for hub, brg in (("upper_arm", "bearing_s"), ("crank", "bearing_e"), ("yaw_shaft", "yaw_bearing")):
-        asm.allow_contact(hub, brg, max_depth=None)                        # nominal bearing seats
+    for p in ("crank", "pulley_e"):                    # bushing on the arm's shaft: two hinges apart on one axis
+        asm.joined(p, "shoulder_shaft")                # (the hubs' nominal bearing seats are carried by their hinges)
 
     # ---- leveling linkage: elbow triangle, rod_1 (F-G), rod_2 (H-K), wrist -----------------------
-    tri = polygon(E, G, H)
+    tri = polygon([E, G, H])
     for p in (E, G, H):
         tri += disc(p, 7)
     for p in (E, G, H):
@@ -252,7 +242,7 @@ def build(L1=150.0, L2=160.0, a=40.0, b=35.0, th1=65.0, th2=-25.0, zS=115.0, t=5
     asm.target("reach", tool_reach, min=280)
     asm.target("reaches desk", tool_low, max=-35)
     asm.target("wrist level", "angle:turntable,wrist", max=0.5)
-    asm.target("yaw range", "span:j_yaw", min=270, study="yaw")
+    asm.target("yaw range", "span:j_yaw", min=270)          # span: the largest sweep of any study
     asm.target("shoulder motor SF", "sf:j_shoulder_motor", min=2)
     asm.target("elbow motor SF", "sf:j_elbow_motor", min=2)
     asm.target("no collision", "clearance", min=0.3)

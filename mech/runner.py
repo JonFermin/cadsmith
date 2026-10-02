@@ -14,9 +14,11 @@ read); it writes ``report.partial.json`` instead.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -33,9 +35,137 @@ from .statics import gravity_loads
 from .targets import evaluate_targets
 
 __all__ = ["analyze", "run", "check", "select_studies", "available_studies", "ensure_utf8_stdio",
-           "viewer_base_url", "OUTPUT_DIR"]
+           "viewer_base_url", "call_with_progress", "StudyProgress", "StepStatus", "OUTPUT_DIR"]
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"  # <repo>/output: what the viewer and CLI use
+_TICKS = 10  # non-terminal progress: one dot per 10 % of a stage
+
+
+def call_with_progress(fn: Callable, *args, progress: Callable | None):
+    """``fn(*args, progress=progress)`` when ``fn`` accepts a ``progress`` keyword (or ``**kw``),
+    else ``fn(*args)`` — the analysis stages gain the callback independently of this module."""
+    if progress is not None:
+        try:
+            params = inspect.signature(fn).parameters
+            accepts = "progress" in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts:
+            try:
+                return fn(*args, progress=progress)
+            except TypeError as exc:  # a signature that lies (C extension, decorator): fall through
+                if "progress" not in str(exc):
+                    raise
+    return fn(*args)
+
+
+class StudyProgress:
+    """stderr progress of one study, fed ``progress(stage, done, total)`` by the solver and the
+    clearance sweep (one call per frame): on a terminal a live ``study walk: 73 frames …
+    clearance 12/73`` line rewritten in place, else one dot per 10 % of each stage on the one line
+    per study. The finished line adds where the time went:
+    ``study walk: 73 frames … solve ·········· clearance ·········· 96.2 s (solve 12.1 s,
+    clearance 84.0 s, loads 0.1 s)``. ``begin(stage)`` starts timing a stage before its first callback (or for one
+    that reports none, like the gravity loads)."""
+
+    def __init__(self, name: str, frames: int, stream=None, clock: Callable[[], float] = time.perf_counter):
+        self.stream = sys.stderr if stream is None else stream
+        self.tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.head = f"study {name}: {frames} frames …"
+        self.clock = clock
+        self.stage: str | None = None
+        self.shown: str | None = None  # the stage whose label the dots follow (non-terminal)
+        self.times: dict[str, float] = {}
+        self.ticks = 0
+        self.width = 0
+        self._since = clock()
+        self._emit(self.head)
+
+    def _emit(self, text: str, end: str = "") -> None:
+        print(text, end=end, file=self.stream, flush=True)
+
+    def _rewrite(self, text: str, end: str = "") -> None:
+        pad = " " * max(0, self.width - len(text))
+        self.width = len(text)
+        self._emit(f"\r{text}{pad}", end)
+
+    def begin(self, stage: str) -> None:
+        """Close the running stage's time and start ``stage``'s."""
+        if stage == self.stage:
+            return
+        now = self.clock()
+        if self.stage is not None:
+            self.times[self.stage] = self.times.get(self.stage, 0.0) + now - self._since
+        self.stage, self._since, self.ticks = stage, now, 0
+
+    def __call__(self, stage: str, done: int, total: int) -> None:
+        self.begin(stage)
+        total = max(int(total), 1)
+        done = min(max(int(done), 0), total)
+        if self.tty:
+            self._rewrite(f"{self.head} {stage} {done}/{total}")
+            return
+        want = done * _TICKS // total
+        if want > self.ticks:
+            if self.shown != stage:
+                self.shown = stage
+                self._emit(f" {stage} ")
+            self._emit("·" * (want - self.ticks))
+            self.ticks = want
+
+    def finish(self, seconds: float) -> None:
+        self.begin("")  # closes the last stage
+        self.times.pop("", None)
+        split = ", ".join(f"{k} {v:.1f} s" for k, v in self.times.items() if k)
+        text = f"{seconds:.1f} s" + (f" ({split})" if len(self.times) > 1 else "")
+        if self.tty:
+            self._rewrite(f"{self.head} {text}", "\n")
+        else:
+            self._emit(f" {text}", "\n")
+
+
+class StepStatus:
+    """stderr status of the steps around the studies (clearance setup, home pose): one
+    ``setup … 20.3 s`` line per step; on a terminal with ``keep=False`` (``mech check``) the line
+    is rewritten in place and cleared by ``close()``, so only the summary stays."""
+
+    def __init__(self, title: str = "", show: bool = True, stream=None, keep: bool = True,
+                 clock: Callable[[], float] = time.perf_counter):
+        self.stream = sys.stderr if stream is None else stream
+        self.tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.title, self.show, self.keep, self.clock = title, show, keep or not self.tty, clock
+        self.width = 0
+
+    def _emit(self, text: str, end: str = "") -> None:
+        print(text, end=end, file=self.stream, flush=True)
+
+    def _rewrite(self, text: str, end: str = "") -> None:
+        self._emit(f"\r{text}{' ' * max(0, self.width - len(text))}", end)
+        self.width = 0 if end else len(text)
+
+    @contextmanager
+    def step(self, label: str) -> Iterator[None]:
+        if not self.show:
+            yield
+            return
+        t0 = self.clock()
+        text = f"{self.title}{label} …"
+        self._rewrite(text) if self.tty else self._emit(text)
+        try:
+            yield
+        finally:
+            took = f" {self.clock() - t0:.1f} s"
+            if not self.tty:
+                self._emit(took, "\n")
+            elif self.keep:
+                self._rewrite(text + took, "\n")
+
+    def close(self) -> None:
+        """Clear a rewritten (``keep=False``) terminal line."""
+        if self.show and self.tty and not self.keep and self.width:
+            self._rewrite("")
+            self._emit("\r")
+            self.width = 0
 
 
 def ensure_utf8_stdio() -> None:
@@ -97,8 +227,11 @@ def analyze(asm: Assembly, *, studies=None, frames=None, export=True, out_root=N
 
     ``studies`` restricts the run to these study names and ``frames`` overrides every study's
     frame count — either makes the run partial (see the module docstring); ``params`` (the
-    build() keyword values) is recorded in the report. ``progress`` prints one line per study on
-    stderr (``study pan: 69 frames … 41.0 s``); None = only when stderr is a terminal.
+    build() keyword values) is recorded in the report. ``progress`` prints the progress on stderr
+    (None = only when stderr is a terminal): ``setup … 0.4 s``, then one line per study fed per
+    frame by the solver and the clearance sweep (``study pan: 69 frames … solve ·········· clearance
+    ·········· 41.0 s (solve 2.1 s, clearance 38.8 s, loads 0.1 s)``; live counts on a terminal,
+    see ``StudyProgress``), then ``home pose clearance … 0.2 s``.
     """
     out_root = OUTPUT_DIR if out_root is None else Path(out_root)
     if params is not None:
@@ -134,19 +267,29 @@ def analyze(asm: Assembly, *, studies=None, frames=None, export=True, out_root=N
         prev = prev_partial  # the same partial run as last time: compare with it in full
 
     show = sys.stderr.isatty() if progress is None else bool(progress)
-    checker = ClearanceChecker(asm)
-    props = {name: part_props(part) for name, part in asm.parts.items()}
+    steps = StepStatus(show=show)
+    with steps.step("setup (clearance pairs, mass)"):
+        checker = ClearanceChecker(asm)
+        props = {name: part_props(part) for name, part in asm.parts.items()}
     results, sweeps, loads = {}, {}, {}
     for s in selected:
-        if show:
-            print(f"study {s.name}: {s.frames} frames …", end="", file=sys.stderr, flush=True)
+        meter = StudyProgress(s.name, s.frames) if show else None
+
+        def stage(name: str) -> None:
+            if meter is not None:
+                meter.begin(name)
+
         t0 = time.perf_counter()
-        results[s.name] = run_study(asm, kin, s)
-        sweeps[s.name] = checker.sweep(results[s.name])
+        stage("solve")
+        results[s.name] = call_with_progress(run_study, asm, kin, s, progress=meter)
+        stage("clearance")
+        sweeps[s.name] = call_with_progress(checker.sweep, results[s.name], progress=meter)
+        stage("loads")
         loads[s.name] = gravity_loads(asm, kin, results[s.name], props)
-        if show:
-            print(f" {time.perf_counter() - t0:.1f} s", file=sys.stderr, flush=True)
-    home = checker.check_pose({p: np.eye(4) for p in asm.parts})
+        if meter is not None:
+            meter.finish(time.perf_counter() - t0)
+    with steps.step("home pose clearance"):
+        home = checker.check_pose({p: np.eye(4) for p in asm.parts})
     roles = kin.roles_for(available)  # a joint driven by a skipped study is still a driver
     full_export = export and not partial_run
     viewer_url = viewer_base_url(viewer_base, asm.name) if full_export else None
@@ -163,21 +306,32 @@ def analyze(asm: Assembly, *, studies=None, frames=None, export=True, out_root=N
     return report
 
 
-def check(asm: Assembly, *, params=None) -> dict:
+def check(asm: Assembly, *, params=None, progress=None) -> dict:
     """``mech check``: validation, study checks, roles/mobility and the home-pose clearance only —
-    no studies are run and nothing is exported."""
+    no studies are run and nothing is exported. ``progress`` (None = when stderr is a terminal)
+    shows what runs on stderr: on a terminal one status line rewritten in place and cleared at
+    the end; with ``progress=True`` elsewhere (``mech check --verbose``) one line per step."""
     if params is not None:
         asm.params = dict(params)
+    show = sys.stderr.isatty() if progress is None else bool(progress)
+    steps = StepStatus(f"check {asm.name}: ", show=show, keep=False)
     try:
-        kin = Kinematics(asm)
-    except ModelError as exc:
-        return invalid_report(asm.name, exc.errors, asm.params)
-    selected, errors = select_studies(asm, kin)
-    if errors:
-        return invalid_report(asm.name, errors, asm.params)
-    home = ClearanceChecker(asm).check_pose({p: np.eye(4) for p in asm.parts})
-    props = {name: part_props(part) for name, part in asm.parts.items()}
-    return build_check_report(asm, kin, props, selected, home, roles=kin.roles_for(selected))
+        with steps.step("validating"):
+            try:
+                kin = Kinematics(asm)
+            except ModelError as exc:
+                return invalid_report(asm.name, exc.errors, asm.params)
+            selected, errors = select_studies(asm, kin)
+        if errors:
+            return invalid_report(asm.name, errors, asm.params)
+        with steps.step("clearance setup"):
+            checker = ClearanceChecker(asm)
+        with steps.step("home pose clearance"):
+            home = checker.check_pose({p: np.eye(4) for p in asm.parts})
+        props = {name: part_props(part) for name, part in asm.parts.items()}
+        return build_check_report(asm, kin, props, selected, home, roles=kin.roles_for(selected))
+    finally:
+        steps.close()
 
 
 def run(asm: Assembly, **kw) -> dict:

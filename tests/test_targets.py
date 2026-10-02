@@ -1,4 +1,4 @@
-"""targets.py: the §2.3 metric vocabulary, worst-over-studies rule and edge cases.
+"""targets.py: the §2.3 metric vocabulary, how study=None combines studies, and edge cases.
 
 Synthetic study results pin down the bookkeeping exactly; a slider-crank and a gravity-loaded
 pendulum check real runs against closed-form values.
@@ -48,24 +48,58 @@ def two_studies():
     return {"a": _result("a", [0.0, 4.0, 10.0]), "b": _result("b", [-5.0, 30.0, 12.0])}
 
 
-def test_joint_metrics_take_the_worst_study(four_bar, two_studies):
+def test_study_none_combines_studies_by_what_the_metric_measures(four_bar, two_studies):
+    """Extents (span/delta/path) take the largest value over the studies — what the mechanism can
+    do: a joint that sweeps 35° in one study can sweep 35°. Positions (min/max) take the extreme
+    over all frames of all studies; the bounds then decide met/missed either way."""
     rows = _eval(four_bar, _report(), two_studies,
                  ("span lo", "span:j_rocker", 20.0, None, None, "FAIL"),  # spans a=10, b=35
                  ("span hi", "span:j_rocker", None, 30.0, None, "WARN"),
                  ("lowest", "min:j_rocker", -10.0, None, None, "FAIL"),  # minima a=0, b=−5
                  ("highest", "max:j_rocker", None, 40.0, None, "FAIL"),  # maxima a=10, b=30
-                 ("band", "span:j_rocker", 5.0, 40.0, None, "FAIL"),  # margins 5 and 5: first wins
-                 ("only b", "span:j_rocker", 20.0, None, "b", "FAIL"))
-    assert (rows["span lo"]["value"], rows["span lo"]["met"], rows["span lo"]["worst_study"]) == (10.0, False, "a")
+                 ("reaches", "max:j_rocker", 25.0, None, None, "FAIL"),  # some study reaches 25: b
+                 ("dips", "min:j_rocker", None, -3.0, None, "FAIL"),  # some study dips below −3: b
+                 ("band", "span:j_rocker", 5.0, 40.0, None, "FAIL"),
+                 ("only b", "span:j_rocker", 20.0, None, "b", "FAIL"),
+                 ("only a", "span:j_rocker", 20.0, None, "a", "FAIL"))
+    assert (rows["span lo"]["value"], rows["span lo"]["met"], rows["span lo"]["worst_study"]) == (35.0, True, "b")
     assert (rows["span hi"]["value"], rows["span hi"]["met"], rows["span hi"]["worst_study"]) == (35.0, False, "b")
     assert rows["span hi"]["severity"] == "WARN"
     assert (rows["lowest"]["value"], rows["lowest"]["met"], rows["lowest"]["worst_study"]) == (-5.0, True, "b")
     assert (rows["highest"]["value"], rows["highest"]["met"], rows["highest"]["worst_study"]) == (30.0, True, "b")
-    assert (rows["band"]["value"], rows["band"]["met"], rows["band"]["worst_study"]) == (10.0, True, "a")
+    assert (rows["reaches"]["value"], rows["reaches"]["met"]) == (30.0, True)  # worst-of-studies said 10: miss
+    assert (rows["dips"]["value"], rows["dips"]["met"]) == (-5.0, True)  # worst-of-studies said 0: miss
+    assert (rows["band"]["value"], rows["band"]["met"], rows["band"]["worst_study"]) == (35.0, True, "b")
     assert (rows["only b"]["value"], rows["only b"]["met"], rows["only b"]["study"]) == (35.0, True, "b")
+    assert (rows["only a"]["value"], rows["only a"]["met"], rows["only a"]["margin"]) == (10.0, False, -10.0)
     assert set(rows["band"]) == {"label", "metric", "value", "min", "max", "margin", "met", "severity", "study",
                                  "worst_study", "error"}
-    assert rows["span lo"]["margin"] == -10.0 and rows["band"]["margin"] == 5.0  # signed: negative = miss
+    assert rows["span lo"]["margin"] == 15.0 and rows["band"]["margin"] == 5.0  # signed: negative = miss
+
+
+def test_aggregation_table():
+    from mech.targets import aggregation
+
+    assert [aggregation(m) for m in ("span:j", "delta:p.z", "path:p")] == ["max"] * 3
+    assert [aggregation(m) for m in ("max:j", "max_dist:a,b", "min:j", "min_dist:a,b")] == ["max", "max", "min", "min"]
+    assert [aggregation(m) for m in ("clearance", "load:j", "sf:j", "rot:p", "angle:a,b")] == ["worst"] * 5
+
+
+def test_probe_extents_take_the_largest_study_and_distances_the_extreme(four_bar):
+    """delta/path: the study that moves the probe furthest; min_dist/max_dist: the closest and the
+    farthest approach over every frame of every study."""
+    a = {"p": [[0, 0, 0], [3, 0, 0]], "q": [[10, 0, 0], [10, 0, 0]]}  # Δx 3, distances 10, 7
+    b = {"p": [[0, 0, 0], [8, 0, 0]], "q": [[20, 0, 0], [20, 0, 0]]}  # Δx 8, distances 20, 12
+    res = {"a": _result("a", [0.0, 1.0], a), "b": _result("b", [0.0, 1.0], b)}
+    rows = _eval(four_bar, _report(), res,
+                 ("stroke", "delta:p.x", 5.0, None, None, "FAIL"),
+                 ("travel", "path:p", None, 6.0, None, "FAIL"),
+                 ("closest", "min_dist:p,q", 5.0, None, None, "FAIL"),
+                 ("farthest", "max_dist:p,q", None, 15.0, None, "FAIL"))
+    assert (rows["stroke"]["value"], rows["stroke"]["met"], rows["stroke"]["worst_study"]) == (8.0, True, "b")
+    assert (rows["travel"]["value"], rows["travel"]["met"]) == (8.0, False)  # a limit on the largest travel
+    assert (rows["closest"]["value"], rows["closest"]["met"], rows["closest"]["worst_study"]) == (7.0, True, "a")
+    assert (rows["farthest"]["value"], rows["farthest"]["met"], rows["farthest"]["worst_study"]) == (20.0, False, "b")
 
 
 def test_probe_metrics(four_bar):
@@ -109,7 +143,7 @@ def test_report_based_metrics(four_bar):
     assert (rows["sf b"]["value"], rows["sf b"]["met"], rows["sf b"]["error"]) == (None, True, "unbounded (∞)")
     assert rows["sf free"]["met"] is False and "no actuator capacity" in rows["sf free"]["error"]
     assert (rows["mass"]["value"], rows["mass"]["met"], rows["mass"]["worst_study"]) == (38.25, True, None)
-    assert (rows["f"]["value"], rows["f"]["met"], rows["f"]["metric"]) == (19.125, False, "<lambda>()")
+    assert (rows["f"]["value"], rows["f"]["met"], rows["f"]["metric"]) == (19.125, False, "callable")
     assert rows["boom"]["met"] is False and rows["boom"]["value"] is None
     assert rows["boom"]["error"] == "ZeroDivisionError: division by zero"
 
@@ -132,7 +166,9 @@ def test_metric_name():
     def rocker_ratio(report):
         return 1.0
 
-    assert metric_name("span:j") == "span:j" and metric_name(rocker_ratio) == "rocker_ratio()"
+    # a callable is shown by its target label: neither ``<lambda>`` nor a function name means anything
+    assert metric_name("span:j") == "span:j" and metric_name(rocker_ratio) == "callable"
+    assert metric_name(lambda r: 1.0) == "callable"
 
 
 # ------------------------------------------------------------------------------ real runs
@@ -185,12 +221,24 @@ def test_pendulum_load_and_sf(tmp_path):
 
 
 def test_extent_metrics_skip_studies_that_do_not_move_it(four_bar):
-    res = {"a": _result("a", [3.0, 3.0, 3.0]), "b": _result("b", [0.0, 20.0, 50.0]),
-           "c": _result("c", [0.0, 25.0, 10.0])}
+    """A study that does not move the joint/part says nothing about how far it moves: for a
+    worst-case rotation limit (rot ≥ 30: "every study that turns it turns it 30°") the held study
+    must not count as 0; for the largest-value extents it never wins anyway."""
+    from mech.geom import rot_about_line
+
+    def turns(*degs):
+        return [{"rocker": rot_about_line((0, 0, 0), (0, 0, 1), d)} for d in degs]
+
+    res = {"a": _result("a", [3.0, 3.0, 3.0], transforms=turns(0, 0, 0)),
+           "b": _result("b", [0.0, 20.0, 50.0], transforms=turns(0, 30, 50)),
+           "c": _result("c", [0.0, 25.0, 10.0], transforms=turns(0, 25, 10))}
     rows = _eval(four_bar, _report(["a", "b", "c"]), res,
-                 ("swing", "span:j_rocker", 40.0, None, None, "FAIL"),  # a holds j_rocker: skipped
+                 ("swing", "span:j_rocker", 40.0, None, None, "FAIL"),  # a holds j_rocker
+                 ("tilt", "rot:rocker", 30.0, None, None, "FAIL"),  # a never turns the rocker: skipped
                  ("low", "min:j_rocker", 1.0, None, None, "FAIL"))  # not an extent metric: a counts
-    assert (rows["swing"]["value"], rows["swing"]["met"], rows["swing"]["worst_study"]) == (25.0, False, "c")
+    assert (rows["swing"]["value"], rows["swing"]["met"], rows["swing"]["worst_study"]) == (50.0, True, "b")
+    assert rows["tilt"]["value"] == pytest.approx(25.0) and rows["tilt"]["met"] is False
+    assert rows["tilt"]["worst_study"] == "c"
     assert (rows["low"]["value"], rows["low"]["worst_study"]) == (0.0, "b")
     still = {"a": _result("a", [3.0, 3.0])}
     assert _eval(four_bar, _report(["a"]), still, ("swing", "span:j_rocker", 40.0, None, None, "FAIL"))[
@@ -214,8 +262,9 @@ def test_bounds_allow_float_noise_but_not_real_misses(four_bar):
 
 
 def test_partial_run_leaves_unrun_studies_unevaluated(four_bar):
-    """--study a (b skipped): a target of b, a study=None target nothing in a defines or moves, and a
-    callable that fails on the partial report are not evaluated (met None); a miss on a is real."""
+    """--study a (b skipped): a target of b, a study=None target nothing in a defines or moves, a
+    callable that fails on the partial report, and a miss b could still repair (a maximum short of
+    its min bound) are not evaluated (met None); a miss more studies cannot repair is real."""
     res = {"a": _result("a", [3.0, 3.0, 3.0])}  # j_rocker never moves in a
     report = _report(["a"])
     report["partial"] = {"studies": ["a"], "skipped": ["b"], "frames": None}
@@ -224,6 +273,8 @@ def test_partial_run_leaves_unrun_studies_unevaluated(four_bar):
                  ("swing", "span:j_rocker", 40.0, None, None, "FAIL"),
                  ("gap", "clearance", 0.3, None, None, "FAIL"),
                  ("low", "min:j_rocker", 5.0, None, None, "FAIL"),
+                 ("reach", "max:j_rocker", 5.0, None, None, "FAIL"),
+                 ("cap", "max:j_rocker", None, 2.0, None, "FAIL"),
                  ("b only", lambda r: r["studies"][1]["frames"], 1.0, None, None, "FAIL"),
                  ("mass", "mass_g", None, 10.0, None, "FAIL"))
     assert rows["of b"]["met"] is None and rows["of b"]["error"] == "study 'b' was not run"
@@ -231,7 +282,11 @@ def test_partial_run_leaves_unrun_studies_unevaluated(four_bar):
     assert rows["swing"]["error"] == "not evaluated: nothing moves it in the studies run (studies not run: b)"
     assert rows["gap"]["met"] is None and rows["gap"]["error"].startswith("not evaluated (studies not run: b): ")
     assert rows["b only"]["met"] is None and "IndexError" in rows["b only"]["error"]
-    assert (rows["low"]["value"], rows["low"]["met"]) == (3.0, False)  # more studies can only make it worse
+    assert (rows["low"]["value"], rows["low"]["met"]) == (3.0, False)  # more studies can only lower a minimum
+    assert (rows["reach"]["value"], rows["reach"]["met"]) == (3.0, None)  # b could still reach 5: not evaluated
+    assert rows["reach"]["error"] == ("not evaluated (studies not run: b): largest value so far 3, a skipped study "
+                                     "could still change it")
+    assert (rows["cap"]["value"], rows["cap"]["met"]) == (3.0, False)  # a maximum only grows: a real miss
     assert rows["mass"]["met"] is False  # study-independent
     full = _eval(four_bar, _report(["a"]), res, ("swing", "span:j_rocker", 40.0, None, None, "FAIL"))
     assert (full["swing"]["value"], full["swing"]["met"]) == (0.0, False)  # a full run: nothing moves it
@@ -319,3 +374,22 @@ def test_a_frames_override_still_evaluates_every_target(tmp_path):
     assert rep["partial"] == {"studies": ["turn"], "skipped": [], "frames": 5}
     (t,) = rep["targets"]
     assert t["met"] is True and t["value"] == pytest.approx(2 * SLIDER_CRANK["r"], abs=1e-4)  # 0°, 180° sampled
+
+
+def test_partial_run_callable_miss_is_not_evaluated(four_bar):
+    """A callable can't say which studies it reads (desktop_arm's tool reach is the max over all
+    studies): on a partial run its miss could still be repaired by a skipped study, so it is not
+    evaluated, with the value so far; a callable met on the studies run counts as met; the same
+    miss on a full run is real."""
+    res = {"a": _result("a", [3.0, 3.0, 3.0])}
+    report = _report(["a"])
+    report["partial"] = {"studies": ["a"], "skipped": ["b"], "frames": None}
+    rows = _eval(four_bar, report, res,
+                 ("reach", lambda r: 255.0, 280.0, None, None, "FAIL"),
+                 ("ok", lambda r: 290.0, 280.0, None, None, "FAIL"))
+    assert (rows["reach"]["value"], rows["reach"]["met"]) == (255.0, None)
+    assert rows["reach"]["error"] == ("not evaluated (studies not run: b): value so far 255, a skipped study could "
+                                     "still change it")
+    assert rows["ok"]["met"] is True
+    full = _eval(four_bar, _report(["a"]), res, ("reach", lambda r: 255.0, 280.0, None, None, "FAIL"))
+    assert full["reach"]["met"] is False and full["reach"]["error"] is None

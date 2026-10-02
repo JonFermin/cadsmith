@@ -12,7 +12,7 @@ such frames: there the real mechanism may take either branch).
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -395,13 +395,14 @@ def _branch_jumps(kin: Kinematics, drivers: list[str], poses: list[Pose],
     return jumps
 
 
-def run_study(asm: Assembly, kin: Kinematics, study: Study) -> StudyResult:
+def run_study(asm: Assembly, kin: Kinematics, study: Study,
+              progress: Callable[[str, int, int], None] | None = None) -> StudyResult:
     """Solve every frame of ``study`` and track the probes.
 
     Frame k warm-starts from frame k−1, with frames k−2, k−1 as the secant predictor that keeps
     the branch through singular poses. Assumes ``check_study`` passed; the first frame is reached
     from the home pose. ``singular`` lists the frames that sit on a change or dead point of the
-    loops the study drives.
+    loops the study drives. ``progress("solve", done, total)`` is called after each frame.
     """
     t, drive = sample_drive(study)
     drivers = list(drive)
@@ -410,6 +411,8 @@ def run_study(asm: Assembly, kin: Kinematics, study: Study) -> StudyResult:
         guess = poses[-1].q if poses else None
         before = poses[-2].q if len(poses) >= 2 and poses[-2].ok and poses[-1].ok else None
         poses.append(kin.solve({name: float(v[k]) for name, v in drive.items()}, guess, prev=before))
+        if progress is not None:
+            progress("solve", k + 1, len(t))
     probes = {p.name: np.array([kin.point(pose, p.part, p.point) for pose in poses]) for p in asm.probes}
     singular = [k for k, pose in enumerate(poses) if kin.singular(pose, drivers)]
     return StudyResult(study, t, drive, poses, probes, _branch_jumps(kin, drivers, poses, set(singular)), singular)

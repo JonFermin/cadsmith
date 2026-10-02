@@ -150,7 +150,7 @@ def build(scale=1.0, stations=3, t=3.0, w=7.0, w_tri=8.0, gap=0.8, clearance=0.5
     for i in range(1, 5):
         p = motor.frames[f"hole_{i}"].position
         asm.part(f"screw_{i}", Pos(p.X, y_m - 6, p.Z) * Rot(90, 0, 0) * socket_head_screw("M3", 8), ground=True, color="#3a3a3a")
-        asm.ignore(f"screw_{i}", "motor")                 # threads engage the motor's tapped holes
+        asm.fasten(f"screw_{i}", "motor")                 # M3 threads in the motor's tapped (tap-drill size) holes
 
     # crankshaft: ø8 main journals outside the throws (rods j/k sweep across the axis inside them)
     crank = _cyl_y(0, 0, yb[0] - t_bulk / 2 - 17, y_web(0, -1), 8.0)
@@ -171,7 +171,7 @@ def build(scale=1.0, stations=3, t=3.0, w=7.0, w_tri=8.0, gap=0.8, clearance=0.5
     asm.part("flywheel", fly, material="aluminum", color="#b0b7bf")
     asm.fix("flywheel", "crank")
     coupler = _cyl_y(0, 0, yb[-1] + 6.5, yb[-1] + 32, 18.0) - _cyl_y(0, 0, yb[-1] + 5, yb[-1] + 15.5, 8.0)
-    coupler -= _cyl_y(0, 0, yb[-1] + 15.5, yb[-1] + 34, 5.2)
+    coupler -= _cyl_y(0, 0, yb[-1] + 15.5, yb[-1] + 34, 5.0)   # nominal bore on the motor's ø5 shaft
     asm.part("coupler", coupler, material="aluminum", color="#9aa3ad")
     asm.fix("coupler", "crank")
     asm.revolute("j_crank", "frame", "crank", origin=(0, 0, 0), axis=YAX)

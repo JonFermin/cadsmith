@@ -65,6 +65,19 @@ export async function loadMech(slug) {
   return { scene, report, base };
 }
 
+/**
+ * True when every facet of a parsed STL carries a unit normal. Many STL writers leave the
+ * normals zero (the format allows it); lit with zero normals a part renders pure black.
+ */
+function hasFacetNormals(geom) {
+  const n = geom.attributes.normal;
+  if (!n) return false;
+  for (let i = 0; i < n.count; i += 3) {
+    if (n.getX(i) ** 2 + n.getY(i) ** 2 + n.getZ(i) ** 2 < 0.25) return false;
+  }
+  return true;
+}
+
 /** Load every part's binary STL (paths come from parts[].mesh only). Returns id → geometry. */
 export async function loadGeometries(scene, base) {
   const loader = new STLLoader();
@@ -77,6 +90,7 @@ export async function loadGeometries(scene, base) {
       throw new Error(`${part.mesh}: not a binary STL (${buf.byteLength} bytes for ${n} triangles)`);
     }
     const geom = loader.parse(buf);
+    if (!hasFacetNormals(geom)) geom.computeVertexNormals(); // non-indexed: per-facet, from the winding
     geom.computeBoundingBox();
     return [part.id, geom];
   }));

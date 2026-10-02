@@ -43,8 +43,15 @@ Skip questions about colors, file formats, or anything with a sane default.
 | lids/doors on hinges, clearance at closure | `examples/hinged_box.py` |
 | servo gripper: gear pair + parallelogram jaws, callable target on per-frame transforms | `examples/parallel_gripper.py` |
 | lead-screw driven scissor lift (multi-loop linkage, payload, motor SF) | `examples/scissor_lift.py` |
+| walking linkage, many identical loops in layers, motor screws (`fasten`) | `examples/showcase/strandbeest.py` |
+| engine: master + articulated rods, pistons sliding in barrels | `examples/showcase/radial_engine.py` |
+| planetary gearbox: `internal_gear` ring + `mesh`, couplings, reflected loads | `examples/showcase/planetary.py` |
+| robot arm: belt drives, parallelograms, `polygon` plates, `joined` | `examples/showcase/desktop_arm.py` |
+| hydraulic cylinders (barrel + rod prismatic), bucket four-bar, 5 studies | `examples/showcase/excavator.py` |
+| spatial parallel robot: ball pins in socket rings, IK-driven studies | `examples/showcase/delta_robot.py` |
 
-Copy it to `output/<name>.py` and adapt. Rules that matter most (details in the reference):
+Copy it to `output/<name>.py` and adapt (the showcases are 150–270 lines: borrow their helpers
+and patterns rather than copying them whole). Rules that matter most (details in the reference):
 - `def build(<every tunable as a keyword default>) -> Assembly` and the
   `if __name__ == "__main__": run(build())` footer. Keep it short (~20–50 lines).
 - **Model every part in place**, in world mm at the **home pose** you draw. No local frames.
@@ -53,10 +60,13 @@ Copy it to `output/<name>.py` and adapt. Rules that matter most (details in the 
   (`revolute`/`prismatic`/`fix`). Close loops with `pin`, never a second joint.
 - Choose each joint axis so **+value means the natural direction** (open, raise, extend).
 - Put intent in the script: `actuator` (capacity), `study` (what to sweep), `target`
-  (requirements), `probe` (points whose path you care about), `allow_contact` for nominal fits
-  between parts the joint doesn't carry (overlaps deeper than max_depth=0.1 mm still interfere;
-  max_depth=None for belts on pulleys); `check_clearance` when a joined pair's far-from-hinge near
-  miss matters. Belt/chain drives: `belt(j_motor, j_out, t_motor, t_out)`, not `gear`.
+  (requirements), `probe` (points whose path you care about). Model fits at **nominal** size
+  (no 0.1 mm gaps, never raise `pin_tol`): what a joint carries — including a bearing or eye
+  around its axis — is checked for overlap only. Declare the rest: `joined(a, b)` for a carried
+  pair no joint names, `mesh(ring, planet)` for teeth `gear()` can't name, `fasten(screw, part)`
+  for tapped holes (the screw `fix()`ed to the same body as its part), `allow_contact(a, b)` for other intended touches (`max_depth=None` for belts
+  on pulleys), `check_clearance` when a joined pair's far-from-hinge near miss matters, `ball()`
+  for a spherical joint. Belt/chain drives: `belt(j_motor, j_out, t_motor, t_out)`, not `gear`.
 - Prefer `mech.parts` (motors, bearings, gears, screws, rods, extrusions) with their `frames`
   (`at=motor.frames["shaft"]`) over hand-modeled stand-ins.
 
@@ -83,13 +93,12 @@ ranges j_shoulder −90.0…90.0° · probe tip Δ(130, 0, 260) path 408 mm
 view http://localhost:3000/mech.html?m=pendulum_arm&issue=0&ui=0 · shot: uv run mech shot pendulum_arm
 ```
 
-Line order: header (status, counts, mass, CoG) · FAIL · target_miss · WARN · INFO · loop line
-(`OK loop p_B closed (max 7e-14 mm) · no branch jumps · mobility 0`; `!!` = open loop, branch
-jump, singular frame or leftover mobility) · clearance (always: min gap — negative = overlap
-depth —, the pair, frame and driver values, required gap, pairs checked, allowed-contact pairs —
+Line order: header (status, counts, mass, CoG) · FAIL · target_miss · WARN · INFO · loops (`!!` =
+open loop, branch jump, singular frame or leftover mobility) · clearance (always: min gap —
+negative = overlap depth —, the pair, frame and driver values, required gap, pairs checked —
 quote it when presenting) · loads (max holding load, frame, capacity → SF; `no gravity load on …`
-when every axis is ∥ g) · targets (met ones, then `not evaluated: …`) · ranges (joints, probe Δ
-and path, closed frames only) · Δprev · view.
+when every axis is ∥ g) · targets · ranges (closed frames only) · Δprev · view. Long lists fold
+(`j_p1_0…j_p1_2 −192…0° ×3`, `(+36 passive — --verbose)`); no line exceeds 250 characters.
 
 - Issue lines carry the numbers you need (overlap volume/extent/location, gap + direction,
   failing drive sub-range, offending frame and the values of every driver that moves the pair).
@@ -101,7 +110,8 @@ and path, closed frames only) · Δprev · view.
   --verbose)` means lines were cut; rerun with `--verbose` only if the hidden ones matter.
 - `INVALID` lists every model error in one pass with did-you-mean hints; fix all, rerun.
 - `--study NAME` / `--frames N` runs are **partial**: the header says so (`PASS (partial run:
-  --study tilt, skipped pan)`), targets that depend on skipped studies are `not evaluated`, and
+  --study tilt, skipped pan)`), targets that depend on skipped studies (and every callable's
+  miss) are `not evaluated`, and
   nothing is exported — `output/<name>.mech/` keeps the last full run for the viewer, `mech shot`,
   `mech list` and the next Δprev. A partial PASS is not a design PASS: finish with a full run.
 
@@ -125,11 +135,15 @@ what still fails, why, and the options — don't keep guessing.
 ## 5. Pictures only when needed
 
 `uv run mech shot <name>` renders the report's targeted view (first FAIL/WARN issue, else a
-ghosted quad view) to `output/<name>.mech/shot_*.png` and prints the path; **read the PNG**.
-Options: `--issue i`, `--view iso|top|front|right|left|back|bottom`, `--ghost N`,
-`--layout quad`, `--frame N`, `-o file.png`. Use it to present the design, or when geometry
-placement is in doubt (a part far from where you expected, a surprising interference). The
-first shot after viewer changes rebuilds `previewer/dist` (a few seconds).
+ghosted quad view) to `output/<name>.mech/shot_<options>.png` and prints the path; **read the
+PNG**. Every viewer parameter is a flag: `--issue i`, `--study S --frame N|home`, `--q j:v` (the
+frame nearest those values, instead of `--frame`),
+`--view iso|top|front|right|left|back|bottom` (world planes: `front` looks along +Y), `--cam az,el`,
+`--zoom F`, `--section [-]x|y|z[:mm]`, `--focus/--isolate/--hide P` (isolate: the rest faint),
+`--explode F`, `--axes`,
+`--ghost N`, `--paths 0|1`, `--layout quad`, `--param k=v`, `-o file.png`. A hero picture:
+`--view iso --zoom 1.2 --paths 0`. Use it to present the design, or when geometry placement is in
+doubt. The first shot after viewer changes rebuilds `previewer/dist` (a few seconds).
 
 Interactive viewer for the user: `cd previewer && npm run dev`, then open the `view` URL.
 

@@ -16,12 +16,16 @@ function editDistance(a, b) {
   return prev[b.length];
 }
 
-/** "did you mean" helper for name errors: substring matches or edits ≤ ⅓ of the length. */
-function unknown(kind, name, options) {
+/**
+ * "did you mean" helper for name errors: substring matches (of ≥ 2 characters, so a one-letter
+ * name is not suggested for everything containing it) or edits ≤ ⅓ of the length.
+ */
+export function unknown(kind, name, options) {
   const lower = name.toLowerCase();
   const close = options.filter(o => {
     const opt = o.toLowerCase();
-    return opt.includes(lower) || lower.includes(opt) || editDistance(lower, opt) <= Math.max(1, Math.floor(opt.length / 3));
+    const contains = Math.min(opt.length, lower.length) >= 2 && (opt.includes(lower) || lower.includes(opt));
+    return contains || editDistance(lower, opt) <= Math.max(1, Math.floor(opt.length / 3));
   });
   const hint = close.length ? ` — did you mean ${close.join(', ')}?` : '';
   return new Error(`unknown ${kind} '${name}'${hint} (have: ${options.join(', ') || 'none'})`);
@@ -33,7 +37,10 @@ export class MechModel {
     this.report = report;
     this.parts = scene.parts;
     this.partIds = scene.parts.map(p => p.id);
+    this.partSet = new Set(this.partIds);
     this.joints = new Map(scene.joints.map(j => [j.name, j]));
+    // ball() joints: {name, parent, child, center, joints}; their knuckle bodies are not in `parts`
+    this.balls = scene.balls || [];
     this.studies = scene.studies || [];
     this.issues = report.issues || [];
     // Pre-build Matrix4 arrays once; the timeline scrubs through them every frame.
