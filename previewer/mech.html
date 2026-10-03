@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cadsmith mech viewer</title>
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <a class="brand" href="index.html" title="Manifest previewer">cadsmith</a>
+      <span class="brand-sub">mech</span>
+      <select id="mech-select" title="Mechanism (output/*.mech)"></select>
+      <span id="status-badge" class="badge"></span>
+      <span id="summary"></span>
+      <div class="spacer"></div>
+      <div class="btn-group" id="view-buttons">
+        <button data-view="iso">Iso</button>
+        <button data-view="top">Top</button>
+        <button data-view="front">Front</button>
+        <button data-view="right">Right</button>
+        <button id="btn-fit" title="Fit (F)">Fit</button>
+      </div>
+      <button id="btn-quad" class="toggle" title="2×2 iso / top / front / right">Quad</button>
+      <button id="btn-link" title="Copy a link to this view">Copy link</button>
+      <a class="navlink" href="index.html">Manifests</a>
+    </header>
+    <div id="main">
+      <aside id="left" class="panel">
+        <section>
+          <h2>Issues <span class="count" id="issue-count"></span></h2>
+          <ul id="issues" class="list"></ul>
+        </section>
+        <section id="targets-section">
+          <h2>Targets</h2>
+          <ul id="targets" class="list"></ul>
+        </section>
+        <section>
+          <h2>Parts <span class="count" id="part-count"></span></h2>
+          <ul id="parts" class="list"></ul>
+        </section>
+      </aside>
+      <div id="stage">
+        <canvas id="viewport"></canvas>
+        <div id="labels"></div>
+        <div id="quad-labels" hidden><span>ISO</span><span>TOP</span><span>FRONT</span><span>RIGHT</span></div>
+        <div id="isolate-chip" hidden><span></span><button id="btn-show-all">Show all</button></div>
+        <div id="tooltip" hidden></div>
+        <div id="message">Loading…</div>
+      </div>
+      <aside id="right" class="panel">
+        <section>
+          <h2>Pose</h2>
+          <div id="hud"></div>
+        </section>
+        <section>
+          <h2>Display</h2>
+          <label class="row"><input type="checkbox" id="chk-axes" /> Joint axes</label>
+          <label class="row"><input type="checkbox" id="chk-probes" checked /> Probe paths</label>
+          <label class="slider">Explode <output id="out-explode"></output>
+            <input type="range" id="rng-explode" min="0" max="1" step="0.01" value="0" /></label>
+          <label class="slider">Ghost poses <output id="out-ghost"></output>
+            <input type="range" id="rng-ghost" min="0" max="12" step="1" value="0" /></label>
+          <div class="row section-row">
+            Section
+            <select id="sel-section">
+              <option value="">off</option><option value="x">X</option><option value="y">Y</option><option value="z">Z</option>
+            </select>
+            <label><input type="checkbox" id="chk-flip" /> flip</label>
+          </div>
+          <label class="slider" id="section-offset-row">Offset <output id="out-section"></output>
+            <input type="range" id="rng-section" min="0" max="1" step="0.1" value="0" /></label>
+        </section>
+        <section class="keys">
+          <h2>Keys</h2>
+          <p><kbd>Space</kbd> play · <kbd>←</kbd><kbd>→</kbd> step · <kbd>H</kbd> home · <kbd>F</kbd> fit · <kbd>Esc</kbd> show all</p>
+        </section>
+      </aside>
+    </div>
+    <footer id="timeline">
+      <button id="btn-play" title="Play / pause (Space)">▶</button>
+      <select id="study-select" title="Study"></select>
+      <button id="btn-home" title="Home pose (H)">Home</button>
+      <div id="scrub-wrap">
+        <div id="ticks"></div>
+        <input type="range" id="scrubber" min="0" max="0" step="1" value="0" />
+      </div>
+      <span id="frame-label"></span>
+      <select id="speed" title="Playback speed">
+        <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option>
+      </select>
+    </footer>
+  </div>
+  <script type="module" src="/src/mech/main.js"></script>
+</body>
+</html>
